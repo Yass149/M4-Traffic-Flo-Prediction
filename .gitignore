@@ -1,0 +1,12 @@
+# Ignore Python cache files
+__pycache__/
+*.pyc
+
+# Ignore Jupyter Notebook checkpoints (the auto-saves)
+.ipynb_checkpoints/
+
+# Ignore Mac system files
+.DS_Store
+
+# Ignore large zip files
+*.zip
