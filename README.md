@@ -20,7 +20,7 @@
 * **Rule:** Write your logic in the `modules/` folder (`.py` files). The Notebook is ONLY for importing modules and displaying results.
 
 **3. DO NOT Edit the Master Notebook Simultaneously**
-* **Risk:** Git cannot merge Jupyter Notebooks. If two people save `Group_08_CSMAD_CW2.ipynb` at the same time, the file will corrupt.
+* **Risk:** Git cannot merge Jupyter Notebooks. If two people save `Group_02_CSMAD_CW2.ipynb` at the same time, the file will corrupt.
 * **Rule:** Use a temporary "scratchpad" notebook (e.g., `test_amir.ipynb`) to test your code. **Yassine** will manage the final master notebook updates.
 
 ---
