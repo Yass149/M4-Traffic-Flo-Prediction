@@ -1,4 +1,4 @@
-# 🚦 CSMAD CW2: M4 Traffic Flow Prediction (Group 08)
+# 🚦 CSMAD CW2: M4 Traffic Flow Prediction (Group 02)
 
 **Team:** Yassine, Amir, Ahmed  
 **Deadline:** Tuesday, 16 December 2025 (12:00 Noon)  
@@ -65,7 +65,7 @@ We must follow this structure for the "Technical Implementation" marks.
     │
     ├── data/                     <-- Raw Data (Do not edit these files)
     │
-    ├── Group_08_CSMAD_CW2.ipynb  <-- FINAL SUBMISSION NOTEBOOK (Presentation Only)
+    ├── Group_02_CSMAD_CW2.ipynb  <-- FINAL SUBMISSION NOTEBOOK (Presentation Only)
     └── .gitignore                <-- Keeps the repo clean
 
 ---
