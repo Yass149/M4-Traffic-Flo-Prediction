@@ -223,4 +223,5 @@ def load_weather_data(folder_path):
     combined = combined.set_index("DATE")
 
     print("[INFO] Weather data loaded, cleaned, and indexed successfully.\n")
+    
     return combined
