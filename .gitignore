@@ -10,3 +10,6 @@ __pycache__/
 
 # Ignore large zip files
 *.zip
+
+#Ignore output traffic classified files
+/data/traffic-classified
