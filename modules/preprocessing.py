@@ -1,3 +1,4 @@
+<<<<<<< modules/preprocessing.py
 import os
 import glob
 import pandas as pd
@@ -650,3 +651,4 @@ def process_and_merge(traffic_df: pd.DataFrame, weather_df: pd.DataFrame):
         raise RuntimeError(f"Failed to merge weather + traffic: {e}")
 
     return merged
+>>>>>>> modules/preprocessing.py
