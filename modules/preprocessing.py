@@ -606,8 +606,6 @@ class WeatherPreprocessor:
         return df
     
 
-
-
 def process_and_merge(traffic_df: pd.DataFrame, weather_df: pd.DataFrame):
     """
     Merge 15-minute traffic data with processed 15-minute weather.
