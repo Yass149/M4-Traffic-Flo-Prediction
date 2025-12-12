@@ -13,3 +13,7 @@ __pycache__/
 
 #Ignore output traffic classified files
 /data/traffic-classified
+
+/plots
+
+/myenv

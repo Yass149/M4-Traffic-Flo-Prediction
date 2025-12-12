@@ -1,0 +1,5 @@
+pandas>=2.2
+matplotlib>=3.8
+seaborn>=0.12
+plotly>=6.5
+windrose>=1.6
