@@ -609,40 +609,48 @@ class WeatherPreprocessor:
 def process_and_merge(traffic_df: pd.DataFrame, weather_df: pd.DataFrame):
     """
     Merge 15-minute traffic data with processed 15-minute weather.
+    
+    FIX: Prevents 'Target Leakage' by ensuring we do not forward-fill 
+    missing traffic data, only weather data.
     """
     if traffic_df is None or traffic_df.empty:
         raise ValueError("traffic_df is empty.")
     if weather_df is None or weather_df.empty:
         raise ValueError("weather_df is empty.")
 
-    # Prepare traffic timestamps
+    # 1. Prepare Traffic (Target)
     try:
         traffic_df = traffic_df.copy()
-
         if "timestamp" in traffic_df.columns:
             traffic_df["timestamp"] = pd.to_datetime(traffic_df["timestamp"], errors="coerce")
             traffic_df = traffic_df.dropna(subset=["timestamp"]).set_index("timestamp")
-
-        traffic_df.index = pd.to_datetime(traffic_df.index, errors="coerce")
+        
         traffic_df = traffic_df.sort_index()
+        # Ensure distinct 15min grid
         traffic_df = traffic_df.resample("15min").asfreq()
-
     except Exception as e:
         raise RuntimeError(f"Traffic timestamp processing failed: {e}")
 
-    # Prepare weather timestamps
+    # 2. Prepare Weather (Features)
     try:
         weather_df = weather_df.copy()
         weather_df.index = pd.to_datetime(weather_df.index, errors="coerce")
         weather_df = weather_df.sort_index()
+        # Weather is allowed to be forward filled (atmosphere changes slowly)
+        weather_df = weather_df.resample("15min").ffill()
     except Exception as e:
         raise RuntimeError(f"Weather timestamp processing failed: {e}")
 
-    # Merge
+    # 3. Merge
     try:
+        # Left join: We only care about times where we have TRAFFIC data
         merged = traffic_df.join(weather_df, how="left")
-        merged = merged.ffill(limit=2)
+        
+        # FIX: Fill only weather columns, NOT traffic columns
+        weather_cols = weather_df.columns
+        merged[weather_cols] = merged[weather_cols].ffill(limit=2)
 
+        # Sanity Check: Clip negatives (just in case)
         if "total_volume" in merged.columns:
             merged["total_volume"] = merged["total_volume"].clip(lower=0)
 
