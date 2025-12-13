@@ -1,197 +1,175 @@
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import seaborn as sns
 import pandas as pd
 import numpy as np
 
 class TrafficVisualizer:
     """
-    Handles all Exploratory Data Analysis (EDA) plotting.
-    Consolidates Ahmed's three scripts into one pipeline-ready class.
-    
-    Assigned to: Ahmed
-    Refactored by: Integration Lead
+    Handles all plotting for Traffic Analysis (EDA, Regression, Time Series).
     """
-    
+
     def __init__(self, df):
-        """
-        Args:
-            df (pd.DataFrame): The fully merged 'full_df' (Traffic + Weather + Features).
-        """
         self.df = df.copy()
-        # Set professional style
-        sns.set_theme(style="whitegrid")
-        plt.rcParams['figure.figsize'] = (14, 7)
-        
+        # Ensure date components exist for plotting
+        if 'hour' not in self.df.columns:
+            self.df['hour'] = self.df.index.hour
+        if 'day_of_week' not in self.df.columns:
+            self.df['day_name'] = self.df.index.day_name()
+            self.df['day_of_week'] = self.df.index.dayofweek
+
+    # ===============================================================
+    # 1. EXPLORATORY DATA ANALYSIS (EDA)
+    # ===============================================================
+
     def plot_traffic_overview(self):
-        """
-        Plots the full time series of traffic volume.
-        (From Ahmed's traffic_visualisations.py)
-        """
-        plt.figure()
-        plt.plot(self.df.index, self.df['total_volume'], label='Traffic Volume', color='#1f77b4', alpha=0.6, linewidth=0.5)
-        
-        # Add a rolling average for clarity
-        rolling_mean = self.df['total_volume'].rolling(window=96*7).mean() # 7 Day rolling
-        plt.plot(self.df.index, rolling_mean, label='7-Day Moving Avg', color='red', linewidth=1.5)
-        
-        plt.title("Traffic Volume History (M4 Motorway: 2021-2024)", fontsize=16, weight='bold')
-        plt.ylabel("Volume (Count/15min)")
-        plt.xlabel("Date")
-        plt.legend(loc='upper right')
-        plt.tight_layout()
+        plt.figure(figsize=(15, 5))
+        plt.plot(self.df.index, self.df['total_volume'], color='#333333', linewidth=0.5, alpha=0.8)
+        plt.title("Traffic Volume Overview (Full Timeline)", fontsize=14, weight='bold')
+        plt.ylabel("Volume (Vehicles / 15min)")
+        plt.grid(True, alpha=0.3)
+        plt.show()
+
+    def plot_weekly_patterns(self):
+        plt.figure(figsize=(12, 6))
+        order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+        if 'day_name' not in self.df.columns: self.df['day_name'] = self.df.index.day_name()
+        sns.boxplot(x='day_name', y='total_volume', data=self.df, order=order, palette="viridis")
+        plt.title("Traffic Volume Distribution by Day of Week", fontsize=14, weight='bold')
+        plt.grid(True, alpha=0.3)
         plt.show()
 
     def plot_hourly_profile(self):
-        """
-        Plots the average 24-hour traffic profile.
-        Essential for showing 'Rush Hour' patterns.
-        """
-        plt.figure()
-        # Extract time if not present
-        if 'time' not in self.df.columns:
-            self.df['time'] = self.df.index.time
-            
-        daily_avg = self.df.groupby('time')['total_volume'].mean()
+        self.df['is_weekend'] = self.df.index.dayofweek >= 5
+        weekday = self.df[~self.df['is_weekend']].groupby(self.df[~self.df['is_weekend']].index.hour)['total_volume'].mean()
+        weekend = self.df[self.df['is_weekend']].groupby(self.df[self.df['is_weekend']].index.hour)['total_volume'].mean()
         
-        # Create plot
-        time_labels = [t.strftime('%H:%M') for t in daily_avg.index]
-        plt.plot(time_labels, daily_avg.values, color='#ff7f0e', linewidth=3)
-        plt.fill_between(time_labels, daily_avg.values, color='#ff7f0e', alpha=0.2)
-        
-        # Format X-axis to show every 2 hours
-        plt.xticks(ticks=range(0, len(time_labels), 8), labels=time_labels[::8], rotation=45)
-        plt.title("Average Daily Traffic Profile (Seasonality)", fontsize=16, weight='bold')
-        plt.ylabel("Average Volume")
-        plt.xlabel("Time of Day")
-        plt.grid(True, linestyle='--', alpha=0.7)
-        plt.tight_layout()
+        plt.figure(figsize=(12, 6))
+        plt.plot(weekday.index, weekday.values, label='Weekdays (Mon-Fri)', color='#1f77b4', linewidth=3)
+        plt.plot(weekend.index, weekend.values, label='Weekends (Sat-Sun)', color='#ff7f0e', linewidth=3)
+        plt.title("Average Hourly Traffic Profile", fontsize=14, weight='bold')
+        plt.xlabel("Hour of Day")
+        plt.xticks(range(0, 24))
+        plt.legend()
+        plt.grid(True, alpha=0.3)
         plt.show()
 
-    def plot_weather_impact(self):
-        """
-        Scatter plot of Speed vs Volume, colored by Rain.
-        (From Ahmed's traffic_weather_visualisations.py)
-        """
-        plt.figure(figsize=(12, 8))
-        
-        # Filter out static to make plot clearer
-        subset = self.df.sample(5000) if len(self.df) > 5000 else self.df
-        
-        sns.scatterplot(
-            data=subset, 
-            x='avg_mph', 
-            y='total_volume', 
-            hue='rain_flag', 
-            palette={0: 'blue', 1: 'red'},
-            alpha=0.5
-        )
-        
-        plt.title("Impact of Speed and Rain on Traffic Volume", fontsize=16, weight='bold')
-        plt.xlabel("Average Speed (mph)")
-        plt.ylabel("Traffic Volume")
-        plt.legend(title="Rain (1=Yes)", loc='upper left')
-        plt.show()
-
-    def plot_feature_correlation(self):
-        """
-        Plots heatmap to justify Feature Selection (5% marks).
-        (Combines logic from all files)
-        """
-        plt.figure(figsize=(10, 8))
-        
-        # Select numeric columns only
-        cols = ['total_volume', 'avg_mph', 'temperature_C', 'rain_mm', 'wind_speed_ms', 'visibility_m', 'hour']
-        # Only use columns that exist
+    def plot_correlation_heatmap(self):
+        cols = ['total_volume', 'avg_mph', 'temperature_C', 'precip_mm', 'wind_speed_ms', 'visibility_m']
         valid_cols = [c for c in cols if c in self.df.columns]
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(self.df[valid_cols].corr(), annot=True, cmap='coolwarm', fmt=".2f", vmin=-1, vmax=1)
+        plt.title("Correlation Matrix", fontsize=14, weight='bold')
+        plt.show()
+
+    def plot_speed_flow_relationship(self):
+        if 'avg_mph' not in self.df.columns: return
+        plt.figure(figsize=(10, 6))
+        plt.scatter(self.df['total_volume'], self.df['avg_mph'], alpha=0.05, color='purple', s=2)
+        plt.title("Fundamental Diagram (Speed vs Flow)", fontsize=14, weight='bold')
+        plt.xlabel("Flow (Volume)")
+        plt.ylabel("Speed (mph)")
+        plt.grid(True, alpha=0.3)
+        plt.show()
+
+    # ===============================================================
+    # 2. REGRESSION PLOTS
+    # ===============================================================
+
+    def plot_regression_performance(self, y_true, y_pred, model_name="Model", r2_score=None):
+        plt.figure(figsize=(14, 6))
         
-        corr_df = self.df[valid_cols].corr()
+        # Subplot 1: Time Series (Last 7 Days)
+        plt.subplot(1, 2, 1)
+        subset_n = 96 * 7
+        y_true_sub = y_true.tail(subset_n) if hasattr(y_true, 'tail') else y_true[-subset_n:]
+        y_pred_sub = y_pred[-subset_n:]
         
-        sns.heatmap(corr_df, annot=True, cmap='coolwarm', fmt=".2f", linewidths=0.5)
-        plt.title("Feature Correlation Matrix", fontsize=16, weight='bold')
+        plt.plot(y_true_sub.values, label='Actual', color='grey', alpha=0.8, linewidth=2)
+        plt.plot(y_pred_sub, label='Predicted', color='green', linestyle='--', linewidth=2)
+        plt.title(f"{model_name}: Last 7 Days", fontsize=12, weight='bold')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        # Subplot 2: Scatter
+        plt.subplot(1, 2, 2)
+        plt.scatter(y_true, y_pred, alpha=0.05, color='#1f77b4')
+        max_val = max(y_true.max(), y_pred.max())
+        plt.plot([0, max_val], [0, max_val], 'r--', linewidth=2, label='Perfect Fit')
+        plt.title(f"R2 = {r2_score:.2f}" if r2_score else "Prediction Accuracy", fontsize=12, weight='bold')
+        plt.xlabel("Actual")
+        plt.ylabel("Predicted")
+        plt.grid(True, alpha=0.3)
         plt.tight_layout()
         plt.show()
 
-    def plot_day_type_comparison(self):
-        """
-        Boxplot: School Term (0) vs Holiday/Weekend (1).
-        Required for Phase 3 'Twist' Visual Proof.
-        """
-        if 'day_type' not in self.df.columns:
-            return
+    # ===============================================================
+    # 3. TIME SERIES PLOTS (PUBLICATION QUALITY)
+    # ===============================================================
 
-        plt.figure(figsize=(10, 6))
-        sns.boxplot(x='day_type', y='total_volume', data=self.df, palette="Set2")
-        plt.xticks([0, 1], ['School Term (0)', 'Holiday/Weekend (1)'])
-        plt.title("Distribution: School Term vs. Holiday Traffic", fontsize=16, weight='bold')
-        plt.ylabel("Volume")
+    def plot_forecast_publication_quality(self, train, test, forecast, rmse_val=None):
+        """
+        Plots a high-quality forecast zoomed in on the transition period.
+        """
+        plt.figure(figsize=(16, 7))
+        
+        # 1. Zoom Logic: Only show last 7 days of training
+        # This fixes the "squashed to the right" issue
+        context_days = 7
+        train_zoom = train.tail(24 * context_days)
+
+        # 2. Plot Training (History)
+        plt.plot(train_zoom.index, train_zoom, label='Historical (Last 7 Days)', 
+                 color='gray', alpha=0.6, linewidth=1.5)
+
+        # 3. Plot Actual Test Data
+        plt.plot(test.index, test, label='Actual Ground Truth', 
+                 color='#1f77b4', linewidth=2.5, alpha=0.8)
+
+        # 4. Plot Forecast
+        plt.plot(test.index, forecast, label='SARIMAX Forecast', 
+                 color='#2ca02c', linewidth=3, linestyle='--')
+
+        # 5. Confidence Band
+        if rmse_val is not None:
+            plt.fill_between(test.index, 
+                             forecast - rmse_val, 
+                             forecast + rmse_val, 
+                             color='#2ca02c', alpha=0.15, label='Uncertainty (±1 RMSE)')
+
+        # 6. Split Line
+        split_time = train_zoom.index[-1]
+        plt.axvline(x=split_time, color='red', linestyle=':', linewidth=2, label='Forecast Start')
+
+        # 7. Formatting
+        plt.title("M4 Traffic Forecast: SARIMAX with Fourier Seasonality", fontsize=16, weight='bold')
+        plt.xlabel("Date & Time", fontsize=12)
+        plt.ylabel("Traffic Volume (Vehicles/Hour)", fontsize=12)
+        plt.legend(loc='upper left', fontsize=11, frameon=True)
+        
+        # Date Formatting
+        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%a %H:%M'))
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
         plt.show()
 
-    def plot_regression_performance(self, y_true, y_pred, model_name='Model', r2_score=None):
-        """
-        Plots a professional dashboard for Regression Evaluation.
-        1. Reality Check: Zooms into the last 7 days of VALID data (skips trailing zeros).
-        2. Scatter Plot: Actual vs Predicted with a perfect fit line.
-        """
-        # Ensure inputs are Series with matching indices
-        if not isinstance(y_true, pd.Series):
-            y_true = pd.Series(y_true)
-        if not isinstance(y_pred, pd.Series):
-            y_pred = pd.Series(y_pred, index=y_true.index)
+    def plot_acf_pacf(self, series, lags=48):
+        from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8))
+        plot_acf(series, lags=lags, ax=ax1)
+        plot_pacf(series, lags=lags, ax=ax2)
+        plt.tight_layout()
+        plt.show()
 
-        # --- SMART SLICE LOGIC ---
-        # Find the last timestamp where Actual Volume > 10 (Avoids the flat line at the end)
-        valid_indices = y_true[y_true > 10].index
-        if len(valid_indices) > 0:
-            last_valid_idx = valid_indices.max()
-            loc_idx = y_true.index.get_loc(last_valid_idx)
-            # Slice last 7 days from that point
-            intervals = 96 * 7
-            start_loc = max(0, loc_idx - intervals)
-            zoom_slice = slice(start_loc, loc_idx)
-        else:
-            # Fallback if data is weird
-            zoom_slice = slice(-96*7, None)
-
-        # Create Plot
-        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-
-        # 1. Time Series Zoom
-        axes[0].plot(y_true.index[zoom_slice], y_true.iloc[zoom_slice], label='Actual', color='black', alpha=0.5, linewidth=2)
-        axes[0].plot(y_pred.index[zoom_slice], y_pred.iloc[zoom_slice], label='Predicted', color='#2ca02c', linewidth=1.5, linestyle='--')
-        axes[0].set_title(f"{model_name} Reality Check: Last 7 Valid Days", fontsize=14, weight='bold')
-        axes[0].set_ylabel("Volume")
-        axes[0].legend()
-        axes[0].grid(True, alpha=0.3)
-
-        # 2. Scatter Plot (Sampled for speed/clarity)
-        # Filter out zeros for the scatter to show true correlation
-        mask = y_true > 10
-        y_t_clean = y_true[mask]
-        y_p_clean = y_pred[mask]
-        
-        # Downsample if too large
-        if len(y_t_clean) > 2000:
-            indices = np.random.choice(len(y_t_clean), 2000, replace=False)
-            y_t_samp = y_t_clean.iloc[indices]
-            y_p_samp = y_p_clean.iloc[indices]
-        else:
-            y_t_samp, y_p_samp = y_t_clean, y_p_clean
-
-        axes[1].scatter(y_t_samp, y_p_samp, alpha=0.15, color='#1f77b4')
-        
-        # Perfect fit line
-        limit = y_t_clean.max()
-        axes[1].plot([0, limit], [0, limit], 'r--', linewidth=2, label='Perfect Fit')
-        
-        title = "Prediction Accuracy"
-        if r2_score is not None:
-            title += f" (R2 = {r2_score:.2f})"
-            
-        axes[1].set_title(title, fontsize=14, weight='bold')
-        axes[1].set_xlabel("Actual Volume")
-        axes[1].set_ylabel("Predicted Volume")
-        axes[1].legend()
-        axes[1].grid(True, alpha=0.3)
-
+    def plot_decomposition(self, decomposition):
+        fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(15, 12), sharex=True)
+        decomposition.observed.plot(ax=ax1, color='black')
+        ax1.set_title('STL Decomposition')
+        decomposition.trend.plot(ax=ax2, color='blue')
+        ax2.set_ylabel('Trend')
+        decomposition.seasonal.plot(ax=ax3, color='green')
+        ax3.set_ylabel('Seasonal')
+        decomposition.resid.plot(ax=ax4, color='red', marker='.', linestyle='None')
+        ax4.set_ylabel('Residual')
         plt.tight_layout()
         plt.show()
