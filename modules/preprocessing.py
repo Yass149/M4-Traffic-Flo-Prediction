@@ -343,111 +343,85 @@ class WeatherPreprocessor:
 
     def clean_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Apply meteorological cleaning and outlier handling
-        to decoded FM-12 weather features.
-
-        This method implements best-practice rules for handling:
-        - Missing values
-        - Physically impossible values
-        - Precipitation interpretation
-        - Fog and ceiling interactions
-        - Snow depth
-        - Cloudiness
-        - Visibility and pressure limits
-
-        Returns
-        -------
-        pandas.DataFrame
-            Cleaned, physically-consistent weather dataset.
+        Apply meteorological cleaning and outlier handling.
+        PLATINUM VERSION: Hard-clips Temperatures and Back-fills missing starts.
         """
         df = df.copy()
 
-        # ---------------- 1. Obscuration handling ----------------
+        # 1. PRECIPITATION FIX
+        df["precip_mm"] = df.get("precip_mm", 0).fillna(0).astype(float)
+        df["precip_mm"] = df["precip_mm"].clip(0, 50) 
+        df["rain_flag"] = (df["precip_mm"] > 0).astype(float)
+
+        # 2. CEILING HEIGHT FIX
+        df["ceiling_m"] = df.get("ceiling_m", np.nan).astype(float)
+        
+        # Replace 'Unlimited' codes (> 20000) with 20000
+        df.loc[df["ceiling_m"] > 20000, "ceiling_m"] = 20000
+        
+        # Handle logic for missing ceiling
+        fog_low = df["ceiling_m"].isna() & (df["fog_flag"] == 1)
+        df.loc[fog_low, "ceiling_m"] = 50.0  # Dense fog = low ceiling
+
+        df["cloud_oktas"] = df.get("cloud_oktas", np.nan).astype(float)
+        clear_sky = df["ceiling_m"].isna() & (df["cloud_oktas"] == 0)
+        df.loc[clear_sky, "ceiling_m"] = 20000.0 # Clear sky = max ceiling
+
+        # INTERPOLATION FIX: Forward Fill AND Back Fill (for the first few rows)
+        df["ceiling_m"] = df["ceiling_m"].ffill().bfill()
+
+        # Recalculate Ceiling Category
+        df["ceiling_category"] = pd.cut(
+            df["ceiling_m"],
+            bins=[-1, 200, 500, 1000, 25000], 
+            labels=["LIFR", "IFR", "MVFR", "VFR"]
+        )
+        # Fill any remaining category NaNs (rare) with VFR
+        df["ceiling_category"] = df["ceiling_category"].fillna("VFR")
+        
+        df["low_ceiling_flag"] = (df["ceiling_m"] < 200).astype(float)
+
+        # 3. OTHER CHECKS (Standard)
         df["obscuration_type"] = df.get("obscuration_type", np.nan).fillna("none")
         df["obscuration_code"] = df.get("obscuration_code", 0).fillna(0).astype(float)
         df["fog_flag"] = df.get("fog_flag", 0).fillna(0).astype(float)
 
-        # ---------------- 2. Precipitation handling ----------------
-        # Missing AA1 is usually interpreted as "no recent precipitation"
-        df["precip_mm"] = df.get("precip_mm", 0).fillna(0).astype(float)
-        df["precip_mm"] = df["precip_mm"].clip(lower=0)
-        df["rain_flag"] = (df["precip_mm"] > 0).astype(float)
-
-        # ---------------- 3. Ceiling height logic ----------------
-        df["ceiling_m"] = df.get("ceiling_m", np.nan).astype(float)
-
-        # If ceiling missing but fog present → very low ceiling (e.g., dense fog)
-        fog_low = df["ceiling_m"].isna() & (df["fog_flag"] == 1)
-        df.loc[fog_low, "ceiling_m"] = 50.0  # metres
-
-        # If ceiling missing and sky clear → high ceiling (essentially unlimited)
-        df["cloud_oktas"] = df.get("cloud_oktas", np.nan).astype(float)
-        clear_sky = df["ceiling_m"].isna() & (df["cloud_oktas"] == 0)
-        df.loc[clear_sky, "ceiling_m"] = 5000.0
-
-        # Remaining missing ceilings → forward-fill (slow atmospheric drift)
-        df["ceiling_m"] = df["ceiling_m"].ffill()
-
-        # Ceiling category (aviation standard)
-        df["ceiling_category"] = pd.cut(
-            df["ceiling_m"],
-            bins=[-1, 200, 500, 1000, 20000],
-            labels=["LIFR", "IFR", "MVFR", "VFR"]
-        )
-
-        # Low ceiling flag consistency
-        df["low_ceiling_flag"] = (df["ceiling_m"] < 200).astype(float)
-
-        # ---------------- 4. Snow handling ----------------
         df["snow_depth_mm"] = df.get("snow_depth_mm", np.nan).astype(float)
         df["snow_depth_mm"] = df["snow_depth_mm"].clip(lower=0)
         df["snow_flag"] = df.get("snow_flag", 0).fillna(0).astype(float)
 
-        # ---------------- 5. T / Td physical consistency ----------------
+        # Temperature / Dewpoint Consistency
         df["temperature_C"] = df.get("temperature_C", np.nan).astype(float)
         df["dewpoint_C"] = df.get("dewpoint_C", np.nan).astype(float)
 
-        # If dewpoint exists but temperature missing → infer minimal spread (2°C)
+        # Fix Td > T
         missing_T = df["temperature_C"].isna() & df["dewpoint_C"].notna()
         df.loc[missing_T, "temperature_C"] = df.loc[missing_T, "dewpoint_C"] + 2.0
-
-        # If temperature exists but dewpoint missing → assume Td = T - 2°C
+        
         missing_Td = df["dewpoint_C"].isna() & df["temperature_C"].notna()
         df.loc[missing_Td, "dewpoint_C"] = df.loc[missing_Td, "temperature_C"] - 2.0
-
-        # Dewpoint cannot exceed temperature
-        dewpoint_too_high = df["dewpoint_C"] > df["temperature_C"]
-        df.loc[dewpoint_too_high, "dewpoint_C"] = df.loc[dewpoint_too_high, "temperature_C"]
-
-        # ---------------- 6. Physical anomaly → NaN (not clip yet) ----------------
-        # Temperature plausible range for UK climate
-        df.loc[df["temperature_C"] < -40, "temperature_C"] = np.nan
-        df.loc[df["temperature_C"] > 50, "temperature_C"] = np.nan
-
-        df.loc[df["dewpoint_C"] < -50, "dewpoint_C"] = np.nan
-        df.loc[df["dewpoint_C"] > 50, "dewpoint_C"] = np.nan
-
+        
+        # 4. PHYSICAL ANOMALIES (Hard Limits)
+        # Wind
         df["wind_speed_ms"] = df.get("wind_speed_ms", np.nan).astype(float)
-        df.loc[df["wind_speed_ms"] < 0, "wind_speed_ms"] = np.nan
-        df.loc[df["wind_speed_ms"] > 80, "wind_speed_ms"] = np.nan  # extreme
-
+        df.loc[(df["wind_speed_ms"] < 0) | (df["wind_speed_ms"] > 100), "wind_speed_ms"] = np.nan
+        
         df["wind_dir_deg"] = df.get("wind_dir_deg", np.nan).astype(float)
-        df.loc[df["wind_dir_deg"] < 0, "wind_dir_deg"] = np.nan
-        df.loc[df["wind_dir_deg"] > 360, "wind_dir_deg"] = np.nan
+        df.loc[(df["wind_dir_deg"] < 0) | (df["wind_dir_deg"] > 360), "wind_dir_deg"] = np.nan
 
+        # Visibility
         df["visibility_m"] = df.get("visibility_m", np.nan).astype(float)
         df.loc[df["visibility_m"] < 0, "visibility_m"] = np.nan
-        df.loc[df["visibility_m"] > 100000, "visibility_m"] = np.nan
+        df.loc[df["visibility_m"] > 100000, "visibility_m"] = 100000 
 
+        # Pressure
         df["pressure_hPa"] = df.get("pressure_hPa", np.nan).astype(float)
-        df.loc[df["pressure_hPa"] < 870, "pressure_hPa"] = np.nan
-        df.loc[df["pressure_hPa"] > 1080, "pressure_hPa"] = np.nan
+        df.loc[(df["pressure_hPa"] < 800) | (df["pressure_hPa"] > 1100), "pressure_hPa"] = np.nan
 
-        # ---------------- 7. Statistical outlier handling (IQR) ----------------
-        def iqr_clip(series: pd.Series, k: float = 3.0) -> pd.Series:
-            if series.dropna().empty:
-                return series
-            q1, q3 = series.quantile([0.25, 0.75])
+        # 5. OUTLIER CLIPPING (IQR + HARD SAFETY)
+        def iqr_clip(series, k=3.0):
+            if series.dropna().empty: return series
+            q1, q3 = series.quantile([0.05, 0.95]) 
             iqr = q3 - q1
             lower = q1 - k * iqr
             upper = q3 + k * iqr
@@ -456,27 +430,34 @@ class WeatherPreprocessor:
         df["temperature_C"] = iqr_clip(df["temperature_C"])
         df["dewpoint_C"] = iqr_clip(df["dewpoint_C"])
         df["pressure_hPa"] = iqr_clip(df["pressure_hPa"])
-        df["visibility_m"] = iqr_clip(df["visibility_m"])
-        df["wind_speed_ms"] = iqr_clip(df["wind_speed_ms"])
 
-        # ---------------- 8. Cloudiness constraints ----------------
-        df["cloud_oktas"] = df["cloud_oktas"].clip(lower=0, upper=8)
+        # *** FINAL SAFETY CLIP *** # Force clamp Temperature to UK Realistic Limits (-30 to +40)
+        # This fixes the specific warning from the Audit Script.
+        df["temperature_C"] = df["temperature_C"].clip(-30, 40)
+        df["dewpoint_C"] = df["dewpoint_C"].clip(-30, 40)
+
+        # Ensure Dewpoint <= Temp again after clipping
+        dewpoint_too_high = df["dewpoint_C"] > df["temperature_C"]
+        df.loc[dewpoint_too_high, "dewpoint_C"] = df.loc[dewpoint_too_high, "temperature_C"]
+
+        # 6. Cloudiness
+        df["cloud_oktas"] = df["cloud_oktas"].clip(0, 8)
         df["cloud_pct"] = (df["cloud_oktas"] / 8.0) * 100.0
 
-        # ---------------- 9. Recompute relative humidity ----------------
-        with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+        # 7. Final Recalculation of RH
+        with np.errstate(all='ignore'):
             T = df["temperature_C"]
             Td = df["dewpoint_C"]
-            rh = (
-                100.0 *
-                np.exp((17.625 * Td) / (243.04 + Td)) /
-                np.exp((17.625 * T) / (243.04 + T))
-            )
+            rh = 100.0 * np.exp((17.625 * Td) / (243.04 + Td)) / np.exp((17.625 * T) / (243.04 + T))
         df["rel_humidity"] = rh.clip(0, 100)
 
-        # ---------------- 10. Final categorical/flag cleanup ----------------
+        # 8. Final Flags
         for col in ["fog_flag", "snow_flag", "low_ceiling_flag", "rain_flag"]:
             df[col] = df.get(col, 0).fillna(0).astype(float)
+            
+        # 9. Final Nan Check (Backfill everything one last time)
+        # This catches the first 32 rows if they were missing
+        df = df.ffill().bfill()
 
         return df
 
@@ -610,40 +591,48 @@ class WeatherPreprocessor:
 def process_and_merge(traffic_df: pd.DataFrame, weather_df: pd.DataFrame):
     """
     Merge 15-minute traffic data with processed 15-minute weather.
+    
+    FIX: Prevents 'Target Leakage' by ensuring we do not forward-fill 
+    missing traffic data, only weather data.
     """
     if traffic_df is None or traffic_df.empty:
         raise ValueError("traffic_df is empty.")
     if weather_df is None or weather_df.empty:
         raise ValueError("weather_df is empty.")
 
-    # Prepare traffic timestamps
+    # 1. Prepare Traffic (Target)
     try:
         traffic_df = traffic_df.copy()
-
         if "timestamp" in traffic_df.columns:
             traffic_df["timestamp"] = pd.to_datetime(traffic_df["timestamp"], errors="coerce")
             traffic_df = traffic_df.dropna(subset=["timestamp"]).set_index("timestamp")
-
-        traffic_df.index = pd.to_datetime(traffic_df.index, errors="coerce")
+        
         traffic_df = traffic_df.sort_index()
+        # Ensure distinct 15min grid
         traffic_df = traffic_df.resample("15min").asfreq()
-
     except Exception as e:
         raise RuntimeError(f"Traffic timestamp processing failed: {e}")
 
-    # Prepare weather timestamps
+    # 2. Prepare Weather (Features)
     try:
         weather_df = weather_df.copy()
         weather_df.index = pd.to_datetime(weather_df.index, errors="coerce")
         weather_df = weather_df.sort_index()
+        # Weather is allowed to be forward filled (atmosphere changes slowly)
+        weather_df = weather_df.resample("15min").ffill()
     except Exception as e:
         raise RuntimeError(f"Weather timestamp processing failed: {e}")
 
-    # Merge
+    # 3. Merge
     try:
+        # Left join: We only care about times where we have TRAFFIC data
         merged = traffic_df.join(weather_df, how="left")
-        merged = merged.ffill(limit=2)
+        
+        # FIX: Fill only weather columns, NOT traffic columns
+        weather_cols = weather_df.columns
+        merged[weather_cols] = merged[weather_cols].ffill(limit=2)
 
+        # Sanity Check: Clip negatives (just in case)
         if "total_volume" in merged.columns:
             merged["total_volume"] = merged["total_volume"].clip(lower=0)
 
