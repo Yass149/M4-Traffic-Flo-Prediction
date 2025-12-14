@@ -1,317 +1,414 @@
-# traffic_visualisations.py
 """
-Traffic visualisations A-F with robust output & labeling.
-Saves plots to plots/traffic/
+Traffic Visualisations - Notebook-Friendly (Full)
+=================================================
+Generates all dashboards inline from data/traffic CSVs
 """
 
-import os
-import glob
-import traceback
-import numpy as np
-import pandas as pd
+import os, glob, numpy as np, pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from datetime import timedelta
-from statsmodels.tsa.seasonal import seasonal_decompose
+from matplotlib.gridspec import GridSpec
 
 plt.ioff()
-sns.set(style="whitegrid")
+sns.set_style("whitegrid")
+sns.set_palette("husl")
 
-# -----------------------
-# Helpers
-# -----------------------
-def ensure_dir(path):
-    if not os.path.exists(path):
-        os.makedirs(path)
+def ensure_dir(p):
+    os.makedirs(p, exist_ok=True)
 
-def save_fig(path):
-    try:
-        plt.tight_layout()
-        plt.savefig(path, dpi=150)
-        plt.close()
-        print(f"   ✔ Saved: {path}")
-    except Exception as e:
-        print(f"   ❌ Failed saving {path}: {e}")
-        plt.close()
-
-def safe_plot(title, path, plot_fn):
-    """Run plot_fn() and save figure; robust to exceptions."""
-    print(f"\n--> {title}")
-    try:
-        plot_fn()
-        save_fig(path)
-    except Exception as e:
-        print(f"   ❌ Error creating {title}: {e}")
-        traceback.print_exc()
-        plt.close()
-
-# -----------------------
-# Core pipeline
-# -----------------------
-def generate_traffic_visualisations(out_root="plots/traffic", rolling_window=24, clip_pct=0.90):
-    ensure_dir(out_root)
-
-    # ---------- Load data ----------
+def load_data():
     files = glob.glob("data/traffic/*.csv")
     if not files:
-        raise FileNotFoundError("No traffic CSVs found in data/traffic/")
-    print("Loading files:", files)
+        raise FileNotFoundError("No traffic CSVs in data/traffic/")
 
-    parts = []
+    dfs = []
     for f in files:
-        try:
-            parts.append(pd.read_csv(f))
-            print("  loaded:", f)
-        except Exception as e:
-            print("  failed load:", f, e)
-    df = pd.concat(parts, ignore_index=True)
-    print("Rows loaded:", len(df))
+        df_temp = pd.read_csv(f)
+        dfs.append(df_temp)
 
-    # ---------- Parse timestamps (dayfirst) ----------
-    df["Report Date"] = pd.to_datetime(df.get("Report Date"), dayfirst=True, errors="coerce")
-    df["Time Period Ending Parsed"] = pd.to_datetime(df.get("Time Period Ending"), dayfirst=True, errors="coerce")
-    # Hour of day for intraday analysis
-    df["Hour"] = df["Time Period Ending Parsed"].dt.hour
-    df["Weekday"] = df["Report Date"].dt.day_name()
-    df["Date"] = df["Report Date"].dt.date
-
-    # ---------- Columns of interest ----------
-    size_cols = ["0 - 520 cm", "521  - 660 cm", "661 - 1160 cm", "1160+ cm"]
-    # normalize column names (strip)
+    df = pd.concat(dfs, ignore_index=True)
     df.columns = [c.strip() for c in df.columns]
 
-    # convert numeric columns
+    # Parse dates
+    df["Report Date"] = pd.to_datetime(df["Report Date"], dayfirst=True, errors="coerce")
+    df["Time Period Ending Parsed"] = pd.to_datetime(df["Time Period Ending"], dayfirst=True, errors="coerce")
+    df["Hour"] = df["Time Period Ending Parsed"].dt.hour
+    df["Weekday"] = df["Report Date"].dt.dayofweek
+    df["Date"] = df["Report Date"].dt.date
+    df["YearMonth"] = df["Report Date"].dt.to_period('M')
+    df["Year"] = df["Report Date"].dt.year
+    df["Month"] = df["Report Date"].dt.month
+    df["IsWeekend"] = df["Weekday"].isin([5, 6])
+
+    # Convert numeric columns
+    size_cols = ["0 - 520 cm", "521  - 660 cm", "661 - 1160 cm", "1160+ cm"]
     for c in size_cols + ["Avg mph", "Total Volume"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # drop rows without total volume
-    df = df[df["Total Volume"].notna()].copy()
-    if df.empty:
-        raise ValueError("No rows with Total Volume found after parsing.")
+    # Filter valid data
+    df = df[df["Total Volume"].notna() & (df["Total Volume"] > 0)].copy()
 
-    # ---------- Clip top X% of Total Volume ----------
-    vol_cut = df["Total Volume"].quantile(clip_pct)
-    df["Total Volume Clipped"] = df["Total Volume"].clip(upper=vol_cut)
+    # Site handling
+    if "Site Name" in df.columns:
+        df["Site"] = df["Site Name"]
+    else:
+        df["Site"] = "Unknown"
 
-    # ---------- Output folder ----------
-    ensure_dir(out_root)
+    df["Total Volume Clipped"] = df["Total Volume"].clip(upper=df["Total Volume"].quantile(0.95))
 
-    # ---------- Produce a small summary CSV ----------
-    summary = {
-        "rows": len(df),
-        "start_date": df["Report Date"].min(),
-        "end_date": df["Report Date"].max(),
-        "sites": df["Site Name"].nunique() if "Site Name" in df.columns else None,
-        "total_volume_sum": df["Total Volume"].sum(),
-        "total_volume_clipped_sum": df["Total Volume Clipped"].sum(),
-    }
-    pd.DataFrame([summary]).to_csv(os.path.join(out_root, "summary_stats.csv"), index=False)
-    print("Wrote summary_stats.csv")
+    return df
 
-    # -----------------------
-    # A: Traffic flow over time
-    # -----------------------
-    def plot_total_timeseries():
-        plt.figure(figsize=(14,5))
-        sns.lineplot(x="Report Date", y="Total Volume Clipped", data=df, linewidth=1)
-        plt.title("Total Traffic Volume Over Time (top 10% clipped)")
-        plt.xlabel("Date")
-        plt.ylabel("Total Volume (vehicles)")
-    safe_plot("A - Total Volume Time Series", os.path.join(out_root, "A_total_volume_timeseries.png"), plot_total_timeseries)
+def plot_traffic_inline(show_plots=True, save_plots=False, out_root="plots/traffic"):
+    """
+    Reads CSVs from data/traffic, processes them, and generates all dashboards inline.
 
-    def plot_rolling_mean_median():
-        ser = df.sort_values("Report Date").set_index("Report Date")["Total Volume Clipped"]
-        rolling_mean = ser.rolling(window=rolling_window, min_periods=1).mean()
-        rolling_median = ser.rolling(window=rolling_window, min_periods=1).median()
-        plt.figure(figsize=(14,5))
-        plt.plot(rolling_mean.index, rolling_mean.values, label=f"{rolling_window}-period mean", linewidth=1.5)
-        plt.plot(rolling_median.index, rolling_median.values, label=f"{rolling_window}-period median", linewidth=1.2, linestyle="--")
-        plt.legend()
-        plt.title(f"Rolling mean & median (window={rolling_window})")
-        plt.xlabel("Date")
-        plt.ylabel("Total Volume (vehicles)")
-    safe_plot("A - Rolling mean & median", os.path.join(out_root, "A_rolling_mean_median.png"), plot_rolling_mean_median)
+    Args:
+        show_plots (bool): Display plots inline
+        save_plots (bool): Also save plots to out_root
+        out_root (str): Folder for saved plots
+    """
+    if save_plots:
+        ensure_dir(out_root)
 
-    # -----------------------
-    # B: Volume by vehicle size class
-    # -----------------------
-    def plot_size_stacked_area():
-        grouped = df.groupby("Report Date")[size_cols].sum().fillna(0)
-        if grouped.sum().sum() == 0:
-            raise ValueError("No vehicle-size data available for stacked area.")
-        plt.figure(figsize=(14,6))
-        grouped.plot.area(ax=plt.gca(), cmap="tab20")
-        plt.title("Vehicle Size Class Volume Over Time (stacked)")
-        plt.xlabel("Date")
-        plt.ylabel("Number of vehicles")
-    safe_plot("B - Stacked area: size classes", os.path.join(out_root, "B_size_stacked_area.png"), plot_size_stacked_area)
+    df = load_data()
+    sites = df["Site"].unique()
 
-    def plot_size_distribution_hist():
-        melted = df.melt(id_vars=["Report Date"], value_vars=size_cols, var_name="Size", value_name="Count")
-        plt.figure(figsize=(12,6))
-        sns.histplot(data=melted, x="Count", hue="Size", element="step", stat="count", bins=40)
-        plt.title("Distribution of Counts per Vehicle Size Class")
-        plt.xlabel("Count (vehicles per period)")
-        plt.ylabel("Frequency")
-    safe_plot("B - Size distribution histogram", os.path.join(out_root, "B_size_distribution_hist.png"), plot_size_distribution_hist)
+    # ============================================
+    # DASHBOARD 1: SITE COMPARISON
+    # ============================================
+    fig = plt.figure(figsize=(20, 12))
+    gs = GridSpec(3, 3, hspace=0.35, wspace=0.3)
 
-    def plot_size_boxplots_faceted():
-        # create 2x2 grid where each subplot shows boxplot for one size class with its own y-scale
-        fig, axes = plt.subplots(2,2, figsize=(14,10))
-        axes = axes.flatten()
-        for ax, col in zip(axes, size_cols):
-            if col not in df.columns:
-                ax.text(0.5,0.5,f"{col} missing", ha='center')
-                continue
-            sns.boxplot(x=df[col], ax=ax)
-            ax.set_title(f"Boxplot: {col}")
-            ax.set_xlabel(f"Count (vehicles) for {col}")
-        plt.suptitle("Vehicle Size Class Boxplots (each subplot own y-scale)")
-        plt.tight_layout(rect=[0,0,1,0.95])
-    safe_plot("B - Size-class boxplots (faceted)", os.path.join(out_root, "B_size_boxplots_faceted.png"), plot_size_boxplots_faceted)
+    # 1. Daily trends
+    ax1 = fig.add_subplot(gs[0, :2])
+    daily = df.groupby(['Date', 'Site'])['Total Volume'].sum().reset_index()
+    for s in sites:
+        d = daily[daily['Site'] == s].sort_values('Date')
+        ax1.plot(d['Date'], d['Total Volume'], label=s, lw=2, alpha=0.8)
+    ax1.set_title('Daily Traffic Volume by Site', fontsize=14, fontweight='bold')
+    ax1.set_ylabel('Vehicles')
+    ax1.legend()
+    ax1.grid(alpha=0.3)
 
-    # -----------------------
-    # C: Hourly & daily traffic patterns
-    # -----------------------
-    def plot_hour_weekday_heatmap():
-        pivot = df.pivot_table(index="Hour", columns="Weekday", values="Total Volume Clipped", aggfunc="mean")
-        # Reorder weekdays Monday..Sunday
-        weekdays = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-        cols_present = [d for d in weekdays if d in pivot.columns]
-        plt.figure(figsize=(12,6))
-        sns.heatmap(pivot[cols_present], annot=False, fmt=".0f", cmap="YlGnBu")
-        plt.title("Average Traffic Volume: Hour (rows) × Weekday (cols)")
-        plt.xlabel("Weekday")
-        plt.ylabel("Hour of day")
-    safe_plot("C - Hour × Weekday heatmap", os.path.join(out_root, "C_hour_weekday_heatmap.png"), plot_hour_weekday_heatmap)
+    # 2. Statistics table
+    ax2 = fig.add_subplot(gs[0, 2])
+    ax2.axis('off')
+    txt = ""
+    for s in sites:
+        sd = df[df['Site'] == s]
+        total = sd['Total Volume'].sum()
+        davg = sd.groupby('Date')['Total Volume'].sum().mean()
+        peak = sd.groupby('Hour')['Total Volume'].mean().idxmax()
+        spd_data = sd[sd['Avg mph'].notna()]
+        spd = spd_data['Avg mph'].mean() if len(spd_data) > 0 else 0
+        txt += f"{s}:\n  Total: {total:,.0f}\n  Daily: {davg:,.0f}\n  Peak: {peak:02d}:00\n"
+        if spd > 0: txt += f"  Speed: {spd:.1f}mph\n"
+        txt += "\n"
+    ax2.text(0.05, 0.95, txt, fontsize=10, family='monospace', va='top', transform=ax2.transAxes,
+             bbox=dict(boxstyle='round', fc='lightblue', alpha=0.8))
 
-    def plot_peak_hour_analysis():
-        hourly_sum = df.groupby("Hour")["Total Volume Clipped"].sum()
-        top_hours = hourly_sum.sort_values(ascending=False).head(10)
-        plt.figure(figsize=(10,5))
-        sns.barplot(x=top_hours.index.astype(str), y=top_hours.values)
-        plt.title("Peak Hours (top 10 by summed volume)")
-        plt.xlabel("Hour of day")
-        plt.ylabel("Total Volume (vehicles)")
-    safe_plot("C - Peak hour analysis", os.path.join(out_root, "C_peak_hours_top10.png"), plot_peak_hour_analysis)
+    # 3. Hourly pattern
+    ax3 = fig.add_subplot(gs[1, 0])
+    hrly = df.groupby(['Hour', 'Site'])['Total Volume'].mean().reset_index()
+    for s in sites:
+        d = hrly[hrly['Site'] == s]
+        ax3.plot(d['Hour'], d['Total Volume'], marker='o', label=s, lw=2.5, ms=6)
+    ax3.set_title('Hourly Pattern', fontsize=12, fontweight='bold')
+    ax3.set_xlabel('Hour')
+    ax3.set_ylabel('Avg Vehicles')
+    ax3.set_xticks(range(0,24,3))
+    ax3.legend()
+    ax3.grid(alpha=0.3)
 
-    def plot_average_daily_profile():
-        avg_profile = df.groupby("Hour")["Total Volume Clipped"].mean()
-        plt.figure(figsize=(12,5))
-        sns.lineplot(x=avg_profile.index, y=avg_profile.values)
-        plt.title("Average Daily Profile (mean volume by hour)")
-        plt.xlabel("Hour of day")
-        plt.ylabel("Mean Total Volume (vehicles)")
-        plt.xticks(range(0,24))
-    safe_plot("C - Average daily profile", os.path.join(out_root, "C_average_daily_profile.png"), plot_average_daily_profile)
+    # 4. Weekday pattern
+    ax4 = fig.add_subplot(gs[1, 1])
+    wkd = df.groupby(['Weekday', 'Site'])['Total Volume'].mean().reset_index()
+    days = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun']
+    for s in sites:
+        d = wkd[wkd['Site'] == s]
+        ax4.plot(d['Weekday'], d['Total Volume'], marker='s', label=s, lw=2.5, ms=7)
+    ax4.set_title('Weekly Pattern', fontsize=12, fontweight='bold')
+    ax4.set_xlabel('Day')
+    ax4.set_ylabel('Avg Vehicles')
+    ax4.set_xticks(range(7))
+    ax4.set_xticklabels(days)
+    ax4.legend()
+    ax4.grid(alpha=0.3)
 
-    # -----------------------
-    # D: Traffic flow stability (CV, anomalies)
-    # -----------------------
-    def plot_cv_by_hour():
-        byh = df.groupby("Hour")["Total Volume Clipped"].agg(["mean","std"])
-        byh["cv"] = byh["std"] / byh["mean"].replace(0, np.nan)
-        plt.figure(figsize=(12,5))
-        sns.lineplot(x=byh.index, y="cv", data=byh)
-        plt.title("Coefficient of Variation (CV) by Hour")
-        plt.xlabel("Hour")
-        plt.ylabel("CV (std / mean)")
-    safe_plot("D - CV by hour", os.path.join(out_root, "D_cv_by_hour.png"), plot_cv_by_hour)
+    # 5. Distribution
+    ax5 = fig.add_subplot(gs[1, 2])
+    for s in sites:
+        d = df[df['Site'] == s]['Total Volume']
+        ax5.hist(d, bins=40, alpha=0.6, label=s, density=True, ec='black')
+    ax5.set_title('Volume Distribution', fontsize=12, fontweight='bold')
+    ax5.set_xlabel('Vehicles')
+    ax5.set_ylabel('Density')
+    ax5.legend()
+    ax5.grid(alpha=0.3)
 
-    def plot_anomalies():
-        s = df.sort_values("Report Date")["Total Volume Clipped"].reset_index(drop=True)
-        # z-score anomalies
-        z = (s - s.mean()) / s.std()
-        anomalies_z = z[np.abs(z) > 3].index
-        # IQR anomalies
-        q1, q3 = s.quantile(0.25), s.quantile(0.75)
-        iqr = q3 - q1
-        anomalies_iqr = s[(s < (q1 - 1.5*iqr)) | (s > (q3 + 1.5*iqr))].index
+    # 6. Monthly trends
+    ax6 = fig.add_subplot(gs[2, 0])
+    mnth = df.groupby(['YearMonth', 'Site'])['Total Volume'].sum().reset_index()
+    for s in sites:
+        d = mnth[mnth['Site'] == s]
+        ax6.plot(range(len(d)), d['Total Volume'], marker='o', label=s, lw=2)
+    ax6.set_title('Monthly Trends', fontsize=12, fontweight='bold')
+    ax6.set_xlabel('Month Index')
+    ax6.set_ylabel('Total')
+    ax6.legend()
+    ax6.grid(alpha=0.3)
 
-        dates = df.sort_values("Report Date")["Report Date"].reset_index(drop=True)
-        plt.figure(figsize=(14,5))
-        sns.lineplot(x=dates, y=s, label="Volume (clipped)")
-        if len(anomalies_z):
-            plt.scatter(dates.iloc[anomalies_z], s.iloc[anomalies_z], color="red", label="z-score anomalies")
-        if len(anomalies_iqr):
-            plt.scatter(dates.iloc[anomalies_iqr], s.iloc[anomalies_iqr], color="orange", label="IQR anomalies", marker="x")
-        plt.title("Anomalies in Total Volume (z-score and IQR)")
-        plt.xlabel("Date")
-        plt.ylabel("Total Volume (vehicles)")
-        plt.legend()
-    safe_plot("D - Anomaly detection", os.path.join(out_root, "D_anomalies.png"), plot_anomalies)
+    # 7. Weekday vs Weekend
+    ax7 = fig.add_subplot(gs[2, 1])
+    wkcomp = df.groupby(['Site', 'IsWeekend'])['Total Volume'].mean().reset_index()
+    x = np.arange(len(sites))
+    w = 0.35
+    wkday = [wkcomp[(wkcomp['Site']==s) & (~wkcomp['IsWeekend'])]['Total Volume'].values[0] for s in sites]
+    wkend = [wkcomp[(wkcomp['Site']==s) & (wkcomp['IsWeekend'])]['Total Volume'].values[0] for s in sites]
+    ax7.bar(x-w/2, wkday, w, label='Weekday', color='skyblue', ec='black')
+    ax7.bar(x+w/2, wkend, w, label='Weekend', color='salmon', ec='black')
+    ax7.set_title('Weekday vs Weekend', fontsize=12, fontweight='bold')
+    ax7.set_ylabel('Avg Volume')
+    ax7.set_xticks(x)
+    ax7.set_xticklabels(sites, fontsize=9)
+    ax7.legend()
+    ax7.grid(axis='y', alpha=0.3)
 
-    # -----------------------
-    # E: Trends across months / seasons
-    # -----------------------
-    def plot_monthly_trends():
-        monthly = df.set_index("Report Date").resample("M")["Total Volume Clipped"].sum().reset_index()
-        monthly["Month"] = monthly["Report Date"].dt.to_period("M").astype(str)
-        plt.figure(figsize=(12,5))
-        sns.lineplot(x="Report Date", y="Total Volume Clipped", data=monthly, marker="o")
-        plt.title("Monthly Total Volume")
-        plt.xlabel("Month")
-        plt.ylabel("Total Volume (vehicles)")
-    safe_plot("E - Monthly totals", os.path.join(out_root, "E_monthly_totals.png"), plot_monthly_trends)
+    # 8. Heatmap (first site)
+    ax8 = fig.add_subplot(gs[2, 2])
+    pivot = df[df['Site'] == sites[0]].pivot_table(
+        index="Hour", columns="Weekday", values="Total Volume", aggfunc="mean"
+    )
+    sns.heatmap(pivot, cmap="YlOrRd", ax=ax8, cbar_kws={'label':'Vehicles'}, linewidths=0.5, fmt='.0f', annot=False)
+    ax8.set_title(f'Hour×Day\n({sites[0]})', fontsize=12, fontweight='bold')
+    ax8.set_xticklabels(days)
 
-    def plot_month_on_month_change():
-        monthly = df.set_index("Report Date").resample("M")["Total Volume Clipped"].sum()
-        mom = monthly.pct_change().dropna() * 100.0
-        plt.figure(figsize=(12,5))
-        sns.barplot(x=mom.index.astype(str), y=mom.values)
-        plt.xticks(rotation=45)
-        plt.title("Month-on-Month % Change in Total Volume")
-        plt.xlabel("Month")
-        plt.ylabel("% change")
-    safe_plot("E - Month-on-Month change", os.path.join(out_root, "E_mom_change.png"), plot_month_on_month_change)
+    plt.suptitle('SITE COMPARISON DASHBOARD', fontsize=18, fontweight='bold', y=0.995)
+    if show_plots:
+        plt.show()
+    if save_plots:
+        plt.savefig(os.path.join(out_root, "01_site_comparison.png"), dpi=150, bbox_inches='tight')
+    plt.close()
 
-    def plot_seasonal_decompose():
-        try:
-            
-            ser = df.set_index("Report Date")["Total Volume Clipped"].resample("D").sum().fillna(method="ffill")
-            res = seasonal_decompose(ser, model="additive", period=7, two_sided=False)
-            plt.figure(figsize=(14,9))
-            ax1 = plt.subplot(4,1,1); res.observed.plot(ax=ax1); ax1.set_title("Observed")
-            ax2 = plt.subplot(4,1,2); res.trend.plot(ax=ax2); ax2.set_title("Trend")
-            ax3 = plt.subplot(4,1,3); res.seasonal.plot(ax=ax3); ax3.set_title("Seasonal")
-            ax4 = plt.subplot(4,1,4); res.resid.plot(ax=ax4); ax4.set_title("Residual")
-            plt.tight_layout()
-        except Exception as e:
-            raise RuntimeError("seasonal_decompose failed (install statsmodels?)") from e
-    safe_plot("E - Seasonal decomposition (opt)", os.path.join(out_root, "E_seasonal_decompose.png"), plot_seasonal_decompose)
+    # ============================================
+    # DASHBOARD 2: SPEED ANALYSIS
+    # ============================================
+    dfs = df[df["Avg mph"].notna()].copy()
+    if len(dfs) >= 100:
+        fig = plt.figure(figsize=(20, 12))
+        gs = GridSpec(3, 3, hspace=0.35, wspace=0.3)
 
-    # -----------------------
-    # F: Correlations (Avg mph, volume, size-classes)
-    # -----------------------
-    def plot_weather_traffic_corr_like():
-        cols = ["Total Volume Clipped"]
-        if "Avg mph" in df.columns:
-            cols.append("Avg mph")
-        for c in size_cols:
-            if c in df.columns:
-                cols.append(c)
-        available = [c for c in cols if c in df.columns]
-        if len(available) < 2:
-            raise ValueError("Not enough columns for correlation heatmap")
-        corr = df[available].corr()
-        plt.figure(figsize=(8,6))
-        sns.heatmap(corr, annot=True, cmap="coolwarm", fmt=".2f")
-        plt.title("Correlation: volume, avg mph, size-classes")
-    safe_plot("F - Correlation heatmap", os.path.join(out_root, "F_corr_heatmap.png"), plot_weather_traffic_corr_like)
+        # 1. Speed trends
+        ax1 = fig.add_subplot(gs[0, :2])
+        for s in sites:
+            d = dfs[dfs['Site'] == s].sort_values('Report Date')
+            if len(d) > 50:
+                roll = d.set_index('Report Date')['Avg mph'].rolling(50, min_periods=10).mean()
+                ax1.plot(roll.index, roll.values, label=s, lw=2, alpha=0.8)
+        ax1.set_title('Speed Trends (50-period rolling)', fontsize=14, fontweight='bold')
+        ax1.set_ylabel('mph')
+        ax1.legend()
+        ax1.grid(alpha=0.3)
 
-    def plot_avgmph_vs_volume():
-        if "Avg mph" not in df.columns:
-            raise ValueError("Avg mph not present")
-        plt.figure(figsize=(10,6))
-        sns.scatterplot(x="Avg mph", y="Total Volume Clipped", data=df, alpha=0.5)
-        sns.regplot(x="Avg mph", y="Total Volume Clipped", data=df, scatter=False, color="red")
-        plt.title("Average Speed vs Volume (clipped)")
-        plt.xlabel("Avg speed (mph)")
-        plt.ylabel("Total Volume (vehicles)")
-    safe_plot("F - Avg mph vs Volume", os.path.join(out_root, "F_avgmph_vs_volume.png"), plot_avgmph_vs_volume)
+        # 2. Speed statistics table
+        ax2 = fig.add_subplot(gs[0, 2])
+        ax2.axis('off')
+        txt = ""
+        for s in sites:
+            sp = dfs[dfs['Site'] == s]['Avg mph']
+            if len(sp) > 0:
+                txt += f"{s}:\n  Mean: {sp.mean():.1f}\n  Med: {sp.median():.1f}\n"
+                txt += f"  Std: {sp.std():.1f}\n  Min: {sp.min():.1f}\n  Max: {sp.max():.1f}\n\n"
+        ax2.text(0.05, 0.95, txt, fontsize=10, family='monospace', va='top', transform=ax2.transAxes,
+                 bbox=dict(boxstyle='round', fc='lightyellow', alpha=0.8))
 
-    print("\n✅ All A-F plots generated. Check folder:", out_root)
+        # 3. Hourly speed
+        ax3 = fig.add_subplot(gs[1, 0])
+        hrsp = dfs.groupby(['Hour', 'Site'])['Avg mph'].mean().reset_index()
+        for s in sites:
+            d = hrsp[hrsp['Site'] == s]
+            ax3.plot(d['Hour'], d['Avg mph'], marker='o', label=s, lw=2.5, ms=6)
+        ax3.set_title('Speed by Hour', fontsize=12, fontweight='bold')
+        ax3.set_xlabel('Hour')
+        ax3.set_ylabel('mph')
+        ax3.set_xticks(range(0,24,3))
+        ax3.legend()
+        ax3.grid(alpha=0.3)
+
+        # 4. Speed distribution
+        ax4 = fig.add_subplot(gs[1, 1])
+        for s in sites:
+            sp = dfs[dfs['Site'] == s]['Avg mph']
+            ax4.hist(sp, bins=30, alpha=0.6, label=s, density=True, ec='black')
+        ax4.set_title('Speed Distribution', fontsize=12, fontweight='bold')
+        ax4.set_xlabel('mph')
+        ax4.set_ylabel('Density')
+        ax4.legend()
+        ax4.grid(alpha=0.3)
+
+        # 5. Speed vs Volume
+        ax5 = fig.add_subplot(gs[1, 2])
+        for s in sites:
+            d = dfs[dfs['Site'] == s].sample(min(1000, len(dfs[dfs['Site'] == s])))
+            ax5.scatter(d['Total Volume'], d['Avg mph'], alpha=0.4, label=s, s=30)
+        ax5.set_title('Speed vs Volume', fontsize=12, fontweight='bold')
+        ax5.set_xlabel('Volume')
+        ax5.set_ylabel('mph')
+        ax5.legend()
+        ax5.grid(alpha=0.3)
+
+        # 6. Binned analysis
+        ax6 = fig.add_subplot(gs[2, 0])
+        for s in sites:
+            d = dfs[dfs['Site'] == s][['Avg mph', 'Total Volume']].dropna()
+            if len(d) > 50:
+                bins = np.linspace(d['Total Volume'].min(), d['Total Volume'].max(), 8)
+                d['VB'] = pd.cut(d['Total Volume'], bins=bins)
+                bn = d.groupby('VB')['Avg mph'].median()
+                ax6.plot(range(len(bn)), bn.values, marker='o', label=s, lw=2)
+        ax6.set_title('Speed vs Volume (Binned)', fontsize=12, fontweight='bold')
+        ax6.set_xlabel('Volume Bin')
+        ax6.set_ylabel('Median mph')
+        ax6.legend()
+        ax6.grid(alpha=0.3)
+
+        # 7. Weekday speed
+        ax7 = fig.add_subplot(gs[2, 1])
+        wksp = dfs.groupby(['Weekday', 'Site'])['Avg mph'].mean().reset_index()
+        for s in sites:
+            d = wksp[wksp['Site'] == s]
+            ax7.plot(d['Weekday'], d['Avg mph'], marker='s', label=s, lw=2.5, ms=7)
+        ax7.set_title('Speed by Day', fontsize=12, fontweight='bold')
+        ax7.set_xlabel('Day')
+        ax7.set_ylabel('mph')
+        ax7.set_xticks(range(7))
+        ax7.set_xticklabels(days)
+        ax7.legend()
+        ax7.grid(alpha=0.3)
+
+        # 8. Speed variability
+        ax8 = fig.add_subplot(gs[2, 2])
+        var = dfs.groupby('Hour')['Avg mph'].agg(['mean', 'std']).reset_index()
+        ax8.plot(var['Hour'], var['mean'], marker='o', lw=2, color='blue', label='Mean')
+        ax8.fill_between(var['Hour'], var['mean']-var['std'], var['mean']+var['std'], alpha=0.3, color='blue')
+        ax8.set_title('Speed Variability', fontsize=12, fontweight='bold')
+        ax8.set_xlabel('Hour')
+        ax8.set_ylabel('mph')
+        ax8.set_xticks(range(0,24,3))
+        ax8.legend()
+        ax8.grid(alpha=0.3)
+
+        plt.suptitle('SPEED ANALYSIS DASHBOARD', fontsize=18, fontweight='bold', y=0.995)
+        if show_plots: plt.show()
+        if save_plots: plt.savefig(os.path.join(out_root, "02_speed_analysis.png"), dpi=150, bbox_inches='tight')
+        plt.close()
+
+    # ============================================
+    # DASHBOARD 3: TEMPORAL PATTERNS
+    # ============================================
+    fig = plt.figure(figsize=(20, 12))
+    gs = GridSpec(3, 3, hspace=0.35, wspace=0.3)
+
+    # 1. Monthly trends with trendline
+    ax1 = fig.add_subplot(gs[0, :])
+    mnth = df.groupby('YearMonth')['Total Volume'].sum()
+    ax1.plot(range(len(mnth)), mnth.values, marker='o', lw=2.5, ms=8, color='purple', label='Actual')
+    x = np.arange(len(mnth))
+    z = np.polyfit(x, mnth.values, 1)
+    p = np.poly1d(z)
+    ax1.plot(x, p(x), 'r--', lw=3, label=f'Trend: {z[0]:+,.0f}/mo')
+    ax1.set_title('Monthly Volume & Growth', fontsize=14, fontweight='bold')
+    ax1.set_ylabel('Total')
+    ax1.legend(fontsize=11)
+    ax1.grid(alpha=0.3)
+
+    # 2. Weekday vs Weekend
+    ax2 = fig.add_subplot(gs[1, 0])
+    wkp = df.groupby(['Hour', 'IsWeekend'])['Total Volume'].mean().reset_index()
+    wkp['Type'] = wkp['IsWeekend'].map({True: 'Weekend', False: 'Weekday'})
+    for t in ['Weekday', 'Weekend']:
+        d = wkp[wkp['Type'] == t]
+        col = 'blue' if t == 'Weekday' else 'red'
+        ax2.plot(d['Hour'], d['Total Volume'], marker='o', label=t, lw=3, color=col, ms=6)
+    ax2.set_title('Weekday vs Weekend', fontsize=12, fontweight='bold')
+    ax2.set_xlabel('Hour')
+    ax2.set_ylabel('Avg Volume')
+    ax2.set_xticks(range(0,24,2))
+    ax2.legend()
+    ax2.grid(alpha=0.3)
+
+    # 3. Peak hours
+    ax3 = fig.add_subplot(gs[1, 1])
+    havg = df.groupby('Hour')['Total Volume'].mean()
+    t75 = havg.quantile(0.75)
+    t90 = havg.quantile(0.90)
+    cols = ['red' if x > t90 else 'orange' if x > t75 else 'steelblue' for x in havg.values]
+    ax3.bar(havg.index, havg.values, color=cols, ec='black', lw=1.5)
+    ax3.axhline(t75, color='orange', ls='--', lw=2, label='75th')
+    ax3.axhline(t90, color='red', ls='--', lw=2, label='90th')
+    ax3.set_title('Peak Hours', fontsize=12, fontweight='bold')
+    ax3.set_xlabel('Hour')
+    ax3.set_ylabel('Avg Volume')
+    ax3.legend()
+    ax3.grid(axis='y', alpha=0.3)
+
+    # 4. Day of week
+    ax4 = fig.add_subplot(gs[1, 2])
+    davg = df.groupby('Weekday')['Total Volume'].mean()
+    cols_d = ['skyblue']*5 + ['salmon']*2
+    ax4.bar(range(7), davg.values, color=cols_d, ec='black', lw=1.5)
+    ax4.set_title('By Day of Week', fontsize=12, fontweight='bold')
+    ax4.set_ylabel('Avg Volume')
+    ax4.set_xticks(range(7))
+    ax4.set_xticklabels(days)
+    ax4.grid(axis='y', alpha=0.3)
+
+    # 5. Top 10 days
+    ax5 = fig.add_subplot(gs[2, 0])
+    top = df.groupby('Date')['Total Volume'].sum().sort_values(ascending=False).head(10)
+    ax5.barh(range(len(top)), top.values, color='coral', ec='black', lw=1.5)
+    ax5.set_yticks(range(len(top)))
+    ax5.set_yticklabels([str(d) for d in top.index], fontsize=9)
+    ax5.set_xlabel('Total')
+    ax5.set_title('Top 10 Days', fontsize=12, fontweight='bold')
+    ax5.invert_yaxis()
+    ax5.grid(axis='x', alpha=0.3)
+
+    # 6. Variability
+    ax6 = fig.add_subplot(gs[2, 1])
+    hst = df.groupby('Hour')['Total Volume'].agg(['mean', 'std']).reset_index()
+    hst['cv'] = hst['std'] / hst['mean']
+    ax6t = ax6.twinx()
+    ax6.bar(hst['Hour'], hst['mean'], alpha=0.6, color='skyblue', ec='black')
+    ax6t.plot(hst['Hour'], hst['cv'], color='red', marker='o', lw=2.5, ms=6)
+    ax6.set_xlabel('Hour')
+    ax6.set_ylabel('Mean', color='skyblue')
+    ax6t.set_ylabel('CV', color='red')
+    ax6.set_title('Volume & Variability', fontsize=12, fontweight='bold')
+    ax6.tick_params(axis='y', labelcolor='skyblue')
+    ax6t.tick_params(axis='y', labelcolor='red')
+    ax6.set_xticks(range(0,24,2))
+    ax6.grid(alpha=0.3)
+
+    # 7. Year-over-year
+    ax7 = fig.add_subplot(gs[2, 2])
+    yly = df.groupby(['Year', 'Month'])['Total Volume'].mean().reset_index()
+    for y in sorted(df['Year'].unique()):
+        d = yly[yly['Year'] == y]
+        ax7.plot(d['Month'], d['Total Volume'], marker='o', label=str(y), lw=2.5, ms=6)
+    ax7.set_title('Year-over-Year', fontsize=12, fontweight='bold')
+    ax7.set_xlabel('Month')
+    ax7.set_ylabel('Avg Volume')
+    ax7.set_xticks(range(1,13))
+    ax7.set_xticklabels(['J','F','M','A','M','J','J','A','S','O','N','D'])
+    ax7.legend()
+    ax7.grid(alpha=0.3)
+
+    plt.suptitle('TEMPORAL PATTERNS DASHBOARD', fontsize=18, fontweight='bold', y=0.995)
+    if show_plots: plt.show()
+    if save_plots: plt.savefig(os.path.join(out_root, "03_temporal_patterns.png"), dpi=150, bbox_inches='tight')
+    plt.close()
 
 if __name__ == "__main__":
-    generate_traffic_visualisations()
+    plot_traffic_inline(show_plots=True, save_plots=False)

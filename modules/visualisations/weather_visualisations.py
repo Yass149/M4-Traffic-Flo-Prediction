@@ -1,201 +1,190 @@
-# traffic_visualizations.py
+# weather_visualisations.py  (Notebook-friendly, inline plots)
+
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-import os
+from windrose import WindroseAxes
+from sklearn.preprocessing import StandardScaler
+import matplotlib.dates as mdates
 import glob
-import numpy as np
-import traceback
 
-plt.ioff()  # Disable interactive plotting
+plt.ioff()  # interactive mode off for script usage
 
-# ============================
-# Helpers
-# ============================
-def ensure_dir(path):
-    if not os.path.exists(path):
-        os.makedirs(path)
+# =============================
+# Helper — Clean NOAA value formats
+# =============================
+def clean_noaa_value(col):
+    return (
+        col.astype(str)
+        .str.split(",", expand=True)[0]
+        .str.replace("+", "", regex=False)
+        .str.replace("M", "", regex=False)
+        .str.replace(" ", "", regex=False)
+        .replace("", None)
+        .astype(float)
+    )
 
-
-def save_plot(fig, path):
-    try:
-        fig.tight_layout()
-        fig.savefig(path, dpi=150)
-        plt.close(fig)
-        print(f"   ✔ Saved:", path)
-    except Exception as e:
-        print(f"   ❌ Failed to save {path}: {e}")
-
-
-def safe_plot(title, out_path, plot_func):
+# =============================
+# Main function
+# =============================
+def plot_weather_from_csv(show_plots=True, clip_top=0.90):
     """
-    Wraps each plot in a try/catch so one failure does not stop the pipeline.
-    Same pattern used in Weather Visualisations.
+    Reads all CSVs from data/weather/, processes them, and plots inline.
+
+    Args:
+        show_plots (bool): Whether to display plots inline (use True in notebooks)
+        clip_top (float): Top percentile to clip TMP, DEW, SLP
     """
-    print(f"\n➡ Generating plot: {title}")
-    try:
-        fig = plt.figure(figsize=(14, 6))
-        plot_func(fig)
-        save_plot(fig, out_path)
-    except Exception as e:
-        print(f"   ❌ Error generating {title}: {e}")
-        traceback.print_exc()
-
-
-# ============================
-# Main Function
-# ============================
-def generate_traffic_visualisations(out="plots/traffic"):
-    print("\n====================================")
-    print("🔵 GENERATING TRAFFIC VISUALISATIONS")
-    print("====================================\n")
-
-    ensure_dir(out)
-
-    # ----------- Load CSVs -----------
-    print("📥 Loading CSV files from data/traffic ...")
-    data_files = glob.glob("data/traffic/*.csv")
-
+    data_files = glob.glob("data/weather/*.csv")
     if not data_files:
-        raise FileNotFoundError("No CSV files found in data/traffic/")
+        raise FileNotFoundError("No CSV files found in data/weather/")
 
-    print("   ✔ Files found:", len(data_files))
+    numeric_noaa = ["TMP", "DEW", "SLP", "VIS", "CIG"]
 
-    df_list = []
-    for f in data_files:
+    for file in data_files:
+        print(f"\nProcessing: {file}\n{'='*60}")
+        df = pd.read_csv(file, low_memory=False)
+
+        # -----------------------------
+        # Clean NOAA numeric columns
+        # -----------------------------
+        for col in numeric_noaa:
+            if col in df.columns:
+                df[col] = clean_noaa_value(df[col])
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        # -----------------------------
+        # Parse DATE column
+        # -----------------------------
+        df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
+        df = df.sort_values("DATE")
+
+        # -----------------------------
+        # Clip TMP, DEW, SLP
+        # -----------------------------
+        for col in ["TMP", "DEW", "SLP"]:
+            if col in df.columns:
+                upper = df[col].quantile(clip_top)
+                df[f"{col}_clipped"] = df[col].clip(upper=upper)
+
+        # -----------------------------
+        # 1A — Subplots TMP, DEW, SLP
+        # -----------------------------
         try:
-            part = pd.read_csv(f)
-            df_list.append(part)
-            print("   ✔ Loaded:", f)
+            fig, axes = plt.subplots(3, 1, figsize=(15, 12), sharex=True)
+            axes_info = [
+                ("TMP_clipped", "Temperature (°C)", "tab:red"),
+                ("DEW_clipped", "Dew Point (°C)", "tab:blue"),
+                ("SLP_clipped", "Sea-Level Pressure", "tab:green"),
+            ]
+
+            for ax, (col, title, color) in zip(axes, axes_info):
+                sns.lineplot(ax=ax, x="DATE", y=col, data=df, color=color)
+                ax.set_title(title)
+
+            axes[-1].xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+            axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+            plt.setp(axes[-1].get_xticklabels(), rotation=45)
+            plt.tight_layout()
+            if show_plots:
+                plt.show()
+            plt.close()
         except Exception as e:
-            print("   ❌ Failed to load:", f, e)
+            print("⚠ Subplot time series skipped:", e)
 
-    df = pd.concat(df_list, ignore_index=True)
-    print("\n📊 Total rows loaded:", len(df))
+        # -----------------------------
+        # 1B — Normalized plots
+        # -----------------------------
+        try:
+            scaler = StandardScaler()
+            df_norm = df.copy()
+            for col in ["TMP_clipped", "DEW_clipped", "SLP_clipped"]:
+                df_norm[f"{col.replace('_clipped','')}_norm"] = scaler.fit_transform(df_norm[[col]])
 
-    # ----------- Fix timestamps -----------
-    print("\n🕒 Fixing timestamp formats ...")
-    try:
-        df["Report Date"] = pd.to_datetime(df["Report Date"], dayfirst=True, errors="coerce")
-        df["Hour"] = pd.to_datetime(df["Time Period Ending"], dayfirst=True, errors="coerce").dt.hour
-        print("   ✔ Timestamp parsing successful")
-    except Exception as e:
-        print("   ❌ Timestamp parse error:", e)
+            for col, color in zip(["TMP_norm", "DEW_norm", "SLP_norm"], ["tab:red","tab:blue","tab:green"]):
+                plt.figure(figsize=(15,6))
+                sns.lineplot(x="DATE", y=col, data=df_norm, color=color)
+                plt.title(f"Normalized {col.replace('_norm','').upper()} Over Time")
+                plt.xlabel("Date")
+                plt.ylabel("Z-score")
+                plt.tight_layout()
+                if show_plots:
+                    plt.show()
+                plt.close()
+        except Exception as e:
+            print("⚠ Normalised time series skipped:", e)
 
-    # ----------- Speed columns -----------
-    speed_cols = [
-        '0 - 10 mph','11 - 15 mph','16 - 20 mph','21 - 25 mph','26 - 30 mph',
-        '31 - 35 mph','36 - 40 mph','41 - 45 mph','46 - 50 mph','51 - 55 mph',
-        '56 - 60 mph','61 - 70 mph','71 - 80 mph','80+ mph'
-    ]
+        # -----------------------------
+        # 1C — Monthly averages
+        # -----------------------------
+        try:
+            monthly = df.set_index("DATE").resample("M")[[f"{c}_clipped" for c in ["TMP","DEW","SLP"]]].mean().reset_index()
+            for col in ["TMP_clipped", "DEW_clipped", "SLP_clipped"]:
+                plt.figure(figsize=(15,6))
+                sns.lineplot(x="DATE", y=col, data=monthly)
+                plt.title(f"Monthly Average {col.replace('_clipped','')}")
+                plt.xlabel("Date")
+                plt.ylabel(col.replace('_clipped',''))
+                plt.tight_layout()
+                if show_plots:
+                    plt.show()
+                plt.close()
+        except Exception as e:
+            print("⚠ Monthly avg time series skipped:", e)
 
-    # ----------- Clip extreme values -----------
-    print("\n📉 Clipping extreme volumes (top 10%) ...")
-    try:
-        vol_upper = df['Total Volume'].quantile(0.90)
-        df['Total Volume Clipped'] = df['Total Volume'].clip(upper=vol_upper)
-        print("   ✔ Clipping done")
-    except Exception as e:
-        print("   ❌ Error clipping:", e)
+        # -----------------------------
+        # 2 — Wind Rose
+        # -----------------------------
+        try:
+            df[["wind_dir","wind_speed"]] = df["WND"].astype(str).str.split(",", n=2, expand=True)[[0,1]].astype(float)
+            ax = WindroseAxes.from_ax()
+            ax.bar(df["wind_dir"], df["wind_speed"], normed=True, opening=0.8, edgecolor="white")
+            ax.set_title("Wind Rose")
+            if show_plots:
+                plt.show()
+            plt.close()
+        except Exception as e:
+            print("⚠ Wind rose skipped:", e)
 
-    # ============================
-    # PLOTS
-    # ============================
+        # -----------------------------
+        # 3 — Correlation heatmap
+        # -----------------------------
+        try:
+            plt.figure(figsize=(12,10))
+            sns.heatmap(df[[f"{c}_clipped" for c in ["TMP","DEW","SLP"]]].corr(), annot=True, cmap="coolwarm")
+            plt.title("Correlation Heatmap")
+            plt.tight_layout()
+            if show_plots:
+                plt.show()
+            plt.close()
+        except Exception as e:
+            print("⚠ Heatmap skipped:", e)
 
-    # ---- 1. Timeseries ----
-    safe_plot(
-        "Time Series: Total Volume (Clipped)",
-        f"{out}/total_volume_timeseries.png",
-        lambda fig: sns.lineplot(x='Report Date', y='Total Volume Clipped', data=df)
-    )
+        # -----------------------------
+        # 4 — Quarterly boxplot TMP
+        # -----------------------------
+        try:
+            df["QUARTER"] = df["DATE"].dt.quarter.replace({1:"Q1",2:"Q2",3:"Q3",4:"Q4"})
+            plt.figure(figsize=(12,6))
+            sns.boxplot(x="QUARTER", y="TMP_clipped", data=df)
+            plt.title("Temperature Distribution by Quarter (Top 10% Clipped)")
+            plt.tight_layout()
+            if show_plots:
+                plt.show()
+            plt.close()
+        except Exception as e:
+            print("⚠ Quarterly boxplot skipped:", e)
+         
+        # -----------------------------
+        # 5 — Optional pairplot
+        # -----------------------------   
+            
+        try:
+            sns.pairplot(df[[f"{c}_clipped" for c in ["TMP","DEW","SLP"]]])
+            if show_plots:
+                plt.show()
+            plt.close()
+        except Exception as e:
+            print("⚠ Pairplot skipped:", e)
 
-    # ---- 2. Rolling average ----
-    safe_plot(
-        "Rolling Average Volume (24h)",
-        f"{out}/total_volume_rolling.png",
-        lambda fig: sns.lineplot(
-            x='Report Date',
-            y=df.sort_values('Report Date')['Total Volume Clipped']
-            .rolling(24).mean(),
-            color='orange'
-        )
-    )
-
-    # ---- 3. Speed distribution ----
-    def plot_speed_dist(fig):
-        df_speed = df.melt(id_vars=['Report Date'], value_vars=speed_cols,
-                           var_name='Speed Range', value_name='Count')
-        sns.barplot(x='Speed Range', y='Count', data=df_speed, ci=None)
-        plt.xticks(rotation=90)
-
-    safe_plot(
-        "Speed Distribution",
-        f"{out}/speed_distribution.png",
-        plot_speed_dist
-    )
-
-    # ---- 4. Hour × Day Type ----
-    if "Day Type" in df.columns:
-        def plot_hour_daytype(fig):
-            pivot = df.pivot_table(
-                index='Hour',
-                columns='Day Type',
-                values='Total Volume Clipped',
-                aggfunc='sum'
-            )
-            sns.heatmap(pivot, annot=True, fmt=".0f", cmap='YlGnBu')
-
-        safe_plot(
-            "Heatmap: Hour × Day Type",
-            f"{out}/volume_hour_daytype_heatmap.png",
-            plot_hour_daytype
-        )
-
-    # ---- 5. Cumulative site volume ----
-    safe_plot(
-        "Volume by Site",
-        f"{out}/volume_by_site.png",
-        lambda fig: sns.barplot(
-            x=df.groupby('Site Name')['Total Volume Clipped']
-            .sum()
-            .sort_values(ascending=False).index,
-            y=df.groupby('Site Name')['Total Volume Clipped']
-            .sum()
-            .sort_values(ascending=False).values
-        ) or plt.xticks(rotation=90)
-    )
-
-    # ---- 6. Stacked area speeds ----
-    def plot_area(fig):
-        df_speed_time = df.groupby('Report Date')[speed_cols].sum()
-        df_speed_time.plot.area(ax=plt.gca(), cmap='tab20')
-        plt.ylabel("Volume")
-
-    safe_plot(
-        "Stacked Area Speed Time Series",
-        f"{out}/speed_area_timeseries.png",
-        plot_area
-    )
-
-    # ---- 7. Correlation heatmap ----
-    safe_plot(
-        "Correlation Heatmap",
-        f"{out}/speed_corr_heatmap.png",
-        lambda fig: sns.heatmap(
-            df[speed_cols + ['Total Volume Clipped']].corr(),
-            annot=True, cmap='coolwarm'
-        )
-    )
-
-    print("\n✅ ALL PLOTS SAVED in:", out)
-
-
-# ============================
-# Script Entry
-# ============================
-if __name__ == "__main__":
-    try:
-        generate_traffic_visualisations()
-    except Exception as e:
-        print("\n🔥 Fatal Error:", e)
-        traceback.print_exc()
+    print("\n✅ Finished processing all weather files.\n")

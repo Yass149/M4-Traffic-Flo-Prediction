@@ -1,208 +1,221 @@
-# traffic_weather_relations.py
 """
-Merges traffic data with weather and creates relationship visualisations.
-Saves to plots/traffic_weather/
+Traffic & Weather Analysis - Notebook Friendly
+==============================================
+Call `run_traffic_weather_analysis()` to generate all plots inline
 """
 
-import pandas as pd
+import os, glob, numpy as np, pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-import glob
-import os
-import numpy as np
-import traceback
+from scipy import stats
 
-plt.ioff()
-sns.set(style="whitegrid")
+sns.set_style("whitegrid")
+plt.ion()  # interactive plotting for notebooks
 
-# -----------------------
-# Helpers
-# -----------------------
-def ensure_dir(path):
-    if not os.path.exists(path):
-        os.makedirs(path)
+def load_traffic():
+    dfs = [pd.read_csv(f) for f in glob.glob("data/traffic/*.csv")]
+    df = pd.concat(dfs, ignore_index=True)
+    df["Report Date"] = pd.to_datetime(df["Report Date"], dayfirst=True, errors="coerce")
+    df["Hour"] = pd.to_datetime(df["Time Period Ending"], dayfirst=True, errors="coerce").dt.hour
+    df["Date"] = df["Report Date"].dt.date
+    df["Weekday"] = df["Report Date"].dt.dayofweek
+    df["Month"] = df["Report Date"].dt.to_period('M')
+    for c in ["0 - 520 cm", "521  - 660 cm", "661 - 1160 cm", "1160+ cm", "Avg mph", "Total Volume"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df[df["Total Volume"].notna() & (df["Total Volume"] > 0)]
+    df["Site"] = df["Site Name"] if "Site Name" in df.columns else "Unknown"
+    return df
 
-def save_plot(path):
-    try:
-        plt.tight_layout()
-        plt.savefig(path, dpi=150)
-        plt.close()
-        print(f"   ✔ Saved: {path}")
-    except Exception as e:
-        print(f"   ❌ Failed saving {path}: {e}")
+def load_weather():
+    dfs = [pd.read_csv(f) for f in glob.glob("data/weather/*.csv")]
+    df = pd.concat(dfs, ignore_index=True)
+    df["DATE"] = pd.to_datetime(df["DATE"])
+    df["Date"] = df["DATE"].dt.date
+    if "TMP" in df.columns:
+        df["Temp_C"] = pd.to_numeric(df["TMP"].str.split(",").str[0], errors="coerce") / 10
+    if "WND" in df.columns:
+        df["Wind_ms"] = pd.to_numeric(df["WND"].str.split(",").str[3], errors="coerce") / 10
+    if "VIS" in df.columns:
+        df["Vis_m"] = pd.to_numeric(df["VIS"].str.split(",").str[0], errors="coerce")
+    return df[["Date", "Temp_C", "Wind_ms", "Vis_m"]].groupby("Date").mean().reset_index()
 
-def safe_plot(title, path, plot_fn):
-    print(f"\n--> {title}")
-    try:
-        plot_fn()
-        save_plot(path)
-    except Exception as e:
-        print(f"   ❌ Error creating {title}: {e}")
-        traceback.print_exc()
-        plt.close()
-
-# -----------------------
-# Helper to clean NOAA fields like "+0075,1"
-# -----------------------
-def clean_noaa_value(col):
-    return (
-        col.astype(str)
-           .str.split(",", expand=True)[0]
-           .str.replace("+", "", regex=False)
-           .str.replace("M", "", regex=False)
-           .str.strip()
-    )
-
-# -----------------------
-# Main
-# -----------------------
-def generate_traffic_weather(out_root="plots/traffic_weather"):
-    ensure_dir(out_root)
-
-    # Load traffic
-    t_files = glob.glob("data/traffic/*.csv")
-    if not t_files:
-        raise FileNotFoundError("No traffic CSVs found in data/traffic/")
-    tdfs = [pd.read_csv(f) for f in t_files]
-    tdf = pd.concat(tdfs, ignore_index=True)
-    tdf["Report Date"] = pd.to_datetime(tdf["Report Date"], dayfirst=True, errors="coerce")
-    tdf["Report Date Hour"] = tdf["Report Date"].dt.floor("H")
-    tdf["Time Period Ending Parsed"] = pd.to_datetime(tdf["Time Period Ending"], dayfirst=True, errors="coerce")
-    for c in ["Total Volume","Avg mph"]:
-        if c in tdf.columns:
-            tdf[c] = pd.to_numeric(tdf[c], errors="coerce")
-    # clip top 10%
-    if "Total Volume" in tdf.columns:
-        tdf["Total Volume Clipped"] = tdf["Total Volume"].clip(upper=tdf["Total Volume"].quantile(0.90))
-
-    # Load weather (use same cleaning as weather script)
-    w_files = glob.glob("data/weather/*.csv")
-    if not w_files:
-        raise FileNotFoundError("No weather CSVs found in data/weather/")
-    wdfs = []
-    for f in w_files:
-        w = pd.read_csv(f, low_memory=False)
-        # clean TMP, DEW, SLP, VIS if present
-        for col in ["TMP","DEW","SLP","VIS","CIG"]:
-            if col in w.columns:
-                w[col] = clean_noaa_value(w[col])
-                w[col] = pd.to_numeric(w[col], errors="coerce")
-        w["DATE"] = pd.to_datetime(w["DATE"], errors="coerce")
-        w["DATE_HOUR"] = w["DATE"].dt.floor("H")
-        wdfs.append(w)
-    wdf = pd.concat(wdfs, ignore_index=True)
-
-    # Merge traffic and weather by nearest hour (asof)
-    tdf_sorted = tdf.sort_values("Report Date Hour")
-    wdf_sorted = wdf.sort_values("DATE_HOUR")
-
-    merged = pd.merge_asof(
-        tdf_sorted,
-        wdf_sorted,
-        left_on="Report Date Hour",
-        right_on="DATE_HOUR",
-        direction="nearest",
-        tolerance=pd.Timedelta("1H")
-    )
-
-    # drop rows where no weather matched (if many)
-    merged = merged[merged["TMP"].notna() | merged["DEW"].notna() | merged["SLP"].notna()]
-
-    out = out_root
-    ensure_dir(out)
-
-    # ---- 1. Volume vs Temperature (scatter + regression) ----
-    def plot_vol_vs_temp():
-        if "TMP" not in merged.columns:
-            raise ValueError("TMP not present in merged data")
-        plt.figure(figsize=(10,6))
-        sns.scatterplot(x="TMP", y="Total Volume Clipped", data=merged, alpha=0.5)
-        sns.regplot(x="TMP", y="Total Volume Clipped", data=merged, scatter=False, color="red")
-        plt.title("Traffic Volume vs Temperature (°C)")
-    safe_plot("Volume vs Temperature", os.path.join(out,"volume_vs_temp.png"), plot_vol_vs_temp)
-
-    # ---- 2. Volume vs Dew Point ----
-    def plot_vol_vs_dew():
-        if "DEW" not in merged.columns:
-            raise ValueError("DEW not present")
-        plt.figure(figsize=(10,6))
-        sns.scatterplot(x="DEW", y="Total Volume Clipped", data=merged, alpha=0.5)
-        sns.regplot(x="DEW", y="Total Volume Clipped", data=merged, scatter=False, color="red")
-        plt.title("Traffic Volume vs Dew Point (°C)")
-    safe_plot("Volume vs Dew Point", os.path.join(out,"volume_vs_dew.png"), plot_vol_vs_dew)
-
-    # ---- 3. Hourly heatmap of mean volume by temp bin ----
-    def plot_hour_temp_heatmap():
-        if "TMP" not in merged.columns:
-            raise ValueError("TMP not present")
-        merged["TMP_bin"] = pd.qcut(merged["TMP"].rank(method="first"), 8, labels=False)
-        pivot = merged.pivot_table(index=merged["Report Date"].dt.hour, columns="TMP_bin", values="Total Volume Clipped", aggfunc="mean")
-        plt.figure(figsize=(12,6))
-        sns.heatmap(pivot, cmap="YlOrRd")
-        plt.title("Mean Hourly Volume by Temperature bin")
-        plt.xlabel("Temp bin")
-        plt.ylabel("Hour of day")
-    safe_plot("Hourly heatmap by temp bin", os.path.join(out,"hour_temp_heatmap.png"), plot_hour_temp_heatmap)
-
-    # ---- 4. Rolling comparison volume vs temp ----
-    def plot_rolling_comp():
-        tmp = merged.sort_values("Report Date").set_index("Report Date")
-        tmp["vol_roll_24"] = tmp["Total Volume Clipped"].rolling(24, min_periods=1).mean()
-        tmp["tmp_roll_24"] = tmp["TMP"].rolling(24, min_periods=1).mean()
-        plt.figure(figsize=(14,6))
-        ax = plt.gca()
-        ax2 = ax.twinx()
-        sns.lineplot(x=tmp.index, y="vol_roll_24", data=tmp, ax=ax, label="Volume (24h rolling)", color="tab:blue")
-        sns.lineplot(x=tmp.index, y="tmp_roll_24", data=tmp, ax=ax2, label="Temp (24h rolling)", color="tab:red")
-        ax.set_ylabel("Volume")
-        ax2.set_ylabel("Temperature (°C)")
-        plt.title("Rolling Volume vs Temperature (24h)")
-    safe_plot("Rolling Volume vs Temp", os.path.join(out,"rolling_vol_vs_temp.png"), plot_rolling_comp)
-
-    # ---- 5. Boxplots: volume by weather condition (visibility bins) ----
-    def plot_volume_by_vis():
-        if "VIS" not in merged.columns:
-            raise ValueError("VIS not present")
-        merged["VIS_bin"] = pd.qcut(merged["VIS"].rank(method="first"), 4, labels=["low","med","high","very_high"])
-        plt.figure(figsize=(10,6))
-        sns.boxplot(x="VIS_bin", y="Total Volume Clipped", data=merged, order=["low","med","high","very_high"])
-        plt.title("Volume by Visibility bins")
-    try:
-        safe_plot("Volume by Visibility bins", os.path.join(out,"volume_by_visibility.png"), plot_volume_by_vis)
-    except Exception:
-        pass
-
-    # ---- 6. Correlations (weather vs traffic) ----
-    def plot_weather_traffic_corr():
-        cols = []
-        if "Total Volume Clipped" in merged.columns:
-            cols.append("Total Volume Clipped")
-        for c in ["TMP","DEW","SLP","VIS","Avg mph"]:
-            if c in merged.columns:
-                cols.append(c)
-        if len(cols) < 2:
-            raise ValueError("Not enough columns to compute correlation")
-        corr = merged[cols].corr()
-        plt.figure(figsize=(8,6))
-        sns.heatmap(corr, annot=True, cmap="coolwarm")
-        plt.title("Correlation: traffic vs weather")
-    safe_plot("Correlation heatmap (traffic/weather)", os.path.join(out,"weather_traffic_corr.png"), plot_weather_traffic_corr)
-
-    # ---- 7. Scatter: Avg mph vs Volume colored by TMP quartile ----
-    def plot_speed_volume_temp():
-        if "Avg mph" not in merged.columns:
-            raise ValueError("Avg mph not present")
-        merged_local = merged.dropna(subset=["Avg mph","Total Volume Clipped","TMP"])
-        merged_local["tmp_q"] = pd.qcut(merged_local["TMP"], 4, labels=False)
-        plt.figure(figsize=(12,6))
-        sns.scatterplot(x="Avg mph", y="Total Volume Clipped", hue="tmp_q", palette="viridis", data=merged_local, alpha=0.6)
-        plt.title("Avg mph vs Volume colored by Temp quartile")
-    try:
-        safe_plot("Avg mph vs Volume by Temp quartile", os.path.join(out,"avgmph_vs_volume_tempq.png"), plot_speed_volume_temp)
-    except Exception:
-        pass
-
-    print("\nDone. All traffic+weather visuals saved to:", out)
-
-if __name__ == "__main__":
-    generate_traffic_weather()
+def run_traffic_weather_analysis(save_plots=False, out_dir="plots/traffic_weather"):
+    """
+    Runs the traffic & weather analysis and returns a dictionary of figures.
+    If save_plots=True, figures are saved as PNGs in out_dir.
+    """
+    if save_plots:
+        os.makedirs(out_dir, exist_ok=True)
+    
+    df_t = load_traffic()
+    df_w = load_weather()
+    sites = df_t["Site"].unique()
+    
+    figs = {}  # store all figures
+    
+    # -----------------------------
+    # 1. SITE COMPARISON
+    # -----------------------------
+    fig, axes = plt.subplots(2,2,figsize=(16,10))
+    
+    # Daily volume
+    daily = df_t.groupby(['Date','Site'])['Total Volume'].sum().reset_index()
+    for site in sites:
+        d = daily[daily['Site']==site]
+        axes[0,0].plot(d['Date'], d['Total Volume'], label=site, alpha=0.8)
+    axes[0,0].set_title('Daily Volume: Site Comparison', fontweight='bold', fontsize=13)
+    axes[0,0].set_ylabel('Total Vehicles')
+    axes[0,0].legend()
+    axes[0,0].grid(alpha=0.3)
+    
+    # Hourly patterns
+    hourly = df_t.groupby(['Hour','Site'])['Total Volume'].mean().reset_index()
+    for site in sites:
+        d = hourly[hourly['Site']==site]
+        axes[0,1].plot(d['Hour'], d['Total Volume'], marker='o', label=site, linewidth=2.5)
+    axes[0,1].set_title('Peak Hours by Site', fontweight='bold', fontsize=13)
+    axes[0,1].set_xlabel('Hour')
+    axes[0,1].set_ylabel('Avg Vehicles')
+    axes[0,1].legend()
+    axes[0,1].set_xticks(range(0,24,2))
+    axes[0,1].grid(alpha=0.3)
+    
+    # Speed comparison
+    df_speed = df_t[df_t['Avg mph'].notna()]
+    if len(df_speed) > 100:
+        speed_h = df_speed.groupby(['Hour','Site'])['Avg mph'].mean().reset_index()
+        for site in sites:
+            d = speed_h[speed_h['Site']==site]
+            axes[1,0].plot(d['Hour'], d['Avg mph'], marker='s', label=site, linewidth=2.5)
+        axes[1,0].set_title('Average Speed by Hour', fontweight='bold', fontsize=13)
+        axes[1,0].set_xlabel('Hour')
+        axes[1,0].set_ylabel('mph')
+        axes[1,0].legend()
+        axes[1,0].set_xticks(range(0,24,2))
+        axes[1,0].grid(alpha=0.3)
+    
+    # Summary stats
+    axes[1,1].axis('off')
+    stats_text = "SITE STATISTICS\n" + "="*40 + "\n\n"
+    for site in sites:
+        sd = df_t[df_t['Site']==site]
+        total = sd['Total Volume'].sum()
+        avg_daily = sd.groupby('Date')['Total Volume'].sum().mean()
+        peak = sd.groupby('Hour')['Total Volume'].mean().idxmax()
+        speed = sd['Avg mph'].mean() if len(sd[sd['Avg mph'].notna()])>0 else 0
+        stats_text += f"{site}:\n  Total: {total:,.0f} vehicles\n  Daily avg: {avg_daily:,.0f}\n"
+        stats_text += f"  Peak hour: {peak:02d}:00\n  Avg speed: {speed:.1f} mph\n\n"
+    axes[1,1].text(0.1, 0.9, stats_text, fontsize=11, family='monospace', verticalalignment='top',
+                   bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+    plt.suptitle('1. SITE COMPARISON ANALYSIS', fontsize=16, fontweight='bold')
+    figs['site_comparison'] = fig
+    if save_plots:
+        fig.savefig(os.path.join(out_dir,'01_site_comparison.png'), dpi=150, bbox_inches='tight')
+    
+    # -----------------------------
+    # 2. WEATHER IMPACT
+    # -----------------------------
+    fig, axes = plt.subplots(2,3,figsize=(18,10))
+    dt = df_t.groupby('Date').agg({'Total Volume':'sum','Avg mph':'mean'}).reset_index()
+    merged = pd.merge(dt, df_w, on='Date', how='inner')
+    
+    if len(merged)>30:
+        # Temp vs volume
+        ax = axes[0,0]
+        ax.scatter(merged['Temp_C'], merged['Total Volume'], alpha=0.5, s=40)
+        z = np.polyfit(merged['Temp_C'].dropna(), merged.loc[merged['Temp_C'].notna(),'Total Volume'],1)
+        p = np.poly1d(z)
+        ax.plot(sorted(merged['Temp_C']), p(sorted(merged['Temp_C'])), 'r--', lw=2)
+        corr = merged[['Temp_C','Total Volume']].corr().iloc[0,1]
+        ax.set_title(f'Temperature Impact (r={corr:.3f})', fontweight='bold')
+        ax.set_xlabel('Temperature (°C)')
+        ax.set_ylabel('Total Volume')
+        ax.grid(alpha=0.3)
+        
+        # Wind vs volume
+        ax = axes[0,1]
+        wind_data = merged[merged['Wind_ms'].notna()]
+        if len(wind_data) > 10:
+            ax.scatter(wind_data['Wind_ms'], wind_data['Total Volume'], alpha=0.5, s=40, color='green')
+            corr = wind_data[['Wind_ms','Total Volume']].corr().iloc[0,1]
+            ax.set_title(f'Wind Impact (r={corr:.3f})', fontweight='bold')
+            ax.set_xlabel('Wind Speed (m/s)')
+            ax.set_ylabel('Total Volume')
+            ax.grid(alpha=0.3)
+        
+        # Temp categories
+        ax = axes[0,2]
+        merged['TempCat'] = pd.cut(merged['Temp_C'], bins=[-20,5,15,25,40],
+                                   labels=['Cold <5°C','Cool 5-15°C','Mild 15-25°C','Warm >25°C'])
+        temp_vol = merged.groupby('TempCat')['Total Volume'].mean()
+        bars = ax.bar(range(len(temp_vol)), temp_vol.values, color=['blue','lightblue','orange','red'], edgecolor='black')
+        ax.set_xticks(range(len(temp_vol)))
+        ax.set_xticklabels(temp_vol.index, rotation=15, ha='right')
+        ax.set_title('Volume by Temperature Range', fontweight='bold')
+        ax.set_ylabel('Avg Total Volume')
+        ax.grid(axis='y', alpha=0.3)
+        for bar in bars:
+            h = bar.get_height()
+            ax.text(bar.get_x()+bar.get_width()/2,h,f'{h:,.0f}',ha='center',va='bottom',fontsize=10)
+    
+    plt.suptitle('2. WEATHER IMPACT ON TRAFFIC', fontsize=16, fontweight='bold')
+    figs['weather_impact'] = fig
+    if save_plots:
+        fig.savefig(os.path.join(out_dir,'02_weather_impact.png'), dpi=150, bbox_inches='tight')
+    
+    # -----------------------------
+    # 3. TEMPORAL INSIGHTS
+    # -----------------------------
+    fig, axes = plt.subplots(2,2,figsize=(16,10))
+    df_t['IsWeekend'] = df_t['Weekday'].isin([5,6])
+    wkd = df_t.groupby(['Hour','IsWeekend'])['Total Volume'].mean().reset_index()
+    wkd['Type'] = wkd['IsWeekend'].map({True:'Weekend',False:'Weekday'})
+    for t in ['Weekday','Weekend']:
+        d = wkd[wkd['Type']==t]
+        axes[0,0].plot(d['Hour'], d['Total Volume'], marker='o', label=t, linewidth=2.5)
+    axes[0,0].set_title('Weekday vs Weekend Patterns', fontweight='bold', fontsize=13)
+    axes[0,0].set_xlabel('Hour')
+    axes[0,0].set_ylabel('Avg Volume')
+    axes[0,0].legend()
+    axes[0,0].set_xticks(range(0,24,2))
+    axes[0,0].grid(alpha=0.3)
+    
+    monthly = df_t.groupby('Month')['Total Volume'].sum()
+    axes[0,1].plot(range(len(monthly)), monthly.values, marker='o', linewidth=2, color='purple')
+    axes[0,1].set_title('Monthly Traffic Trend', fontweight='bold', fontsize=13)
+    axes[0,1].set_xlabel('Month')
+    axes[0,1].set_ylabel('Total Volume')
+    axes[0,1].grid(alpha=0.3)
+    x = np.arange(len(monthly))
+    z = np.polyfit(x, monthly.values,1)
+    p = np.poly1d(z)
+    axes[0,1].plot(x,p(x),'r--', linewidth=2,label=f'Trend: {z[0]:+.0f}/mo')
+    axes[0,1].legend()
+    
+    hourly_avg = df_t.groupby('Hour')['Total Volume'].mean()
+    threshold = hourly_avg.quantile(0.75)
+    colors = ['red' if x>threshold else 'steelblue' for x in hourly_avg]
+    axes[1,0].bar(hourly_avg.index, hourly_avg.values,color=colors,edgecolor='black')
+    axes[1,0].axhline(threshold,color='red',linestyle='--',linewidth=2,label=f'75th percentile: {threshold:.0f}')
+    axes[1,0].set_title('Peak Hour Identification', fontweight='bold', fontsize=13)
+    axes[1,0].set_xlabel('Hour')
+    axes[1,0].set_ylabel('Avg Volume')
+    axes[1,0].legend()
+    axes[1,0].set_xticks(range(0,24,2))
+    axes[1,0].grid(axis='y',alpha=0.3)
+    
+    top_days = df_t.groupby('Date')['Total Volume'].sum().sort_values(ascending=False).head(10)
+    axes[1,1].barh(range(len(top_days)), top_days.values,color='coral',edgecolor='black')
+    axes[1,1].set_yticks(range(len(top_days)))
+    axes[1,1].set_yticklabels([str(d) for d in top_days.index],fontsize=9)
+    axes[1,1].set_xlabel('Total Volume')
+    axes[1,1].set_title('Top 10 Busiest Days', fontweight='bold', fontsize=13)
+    axes[1,1].grid(axis='x', alpha=0.3)
+    
+    plt.suptitle('3. TEMPORAL PATTERNS & TRENDS', fontsize=16, fontweight='bold')
+    figs['temporal_insights'] = fig
+    if save_plots:
+        fig.savefig(os.path.join(out_dir,'03_temporal_insights.png'), dpi=150, bbox_inches='tight')
+    
+    return figs
