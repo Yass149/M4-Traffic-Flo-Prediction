@@ -1,4 +1,22 @@
-<<<<<<< modules/preprocessing.py
+"""
+Data Preprocessing Module for Traffic and Weather Analysis.
+
+This module serves as the ETL (Extract, Transform, Load) pipeline for the project.
+It contains two specialized processors and a merging logic:
+1.  `WeatherPreprocessor`: Handles the complex decoding of NOAA ISD FM-12 weather data,
+    including physical consistency checks (e.g., T >= Td) and unit conversions.
+2.  `TrafficPreprocessor`: Standardizes traffic sensor data, aggregates multiple
+    sensors, and resamples them to a regular grid.
+3.  `process_and_merge`: Aligns the two distinct time series onto a single
+    15-minute timeline using a left-join strategy to preserve ground-truth targets.
+
+Dependencies:
+    - pandas
+    - numpy
+    - logging
+    - os, glob
+"""
+
 import os
 import glob
 import pandas as pd
@@ -7,61 +25,32 @@ import logging
 
 class WeatherPreprocessor:
     """
-    End-to-end NOAA ISD FM-12 Weather Preprocessor.
+    End-to-end NOAA ISD FM-12 Weather Preprocessor for traffic modeling.
 
-    This class provides a pipeline for transforming raw NOAA ISD weather
-    CSV files into a clean, analysis-ready dataset suitable for regression
-    and time-series forecasting in traffic modelling contexts.
+    This class transforms raw NOAA ISD CSV files into clean, 15-minute interval datasets.
+    It handles the specific "FM-12" string encoding used by meteorological stations,
+    applies physical constraints (e.g., clipping humidity to 0-100%), and prepares
+    the data for time-series modeling.
 
-    Pipeline steps
-    --------------
-    1) File discovery and safe CSV loading with error handling
-    2) Optional station filter (by STATION column)
-    3) Selection of relevant FM-12 encoded weather fields
-    4) Decoding of FM-12 groups into numerical values:
-         - Temperature, dewpoint, relative humidity
-         - Wind speed & direction
-         - Visibility
-         - Sea-level pressure
-         - Rainfall (AA1)
-         - Ceiling height
-         - Cloud cover (oktas + %)
-         - Fog / haze / obscuration
-         - Snow depth
-    5) Meteorologically-informed cleaning and outlier handling:
-         - Physical consistency checks
-         - T / Td relationships
-         - Fog & ceiling interactions
-         - Snow & precipitation logic
-    6) Resampling to 15-minute intervals with:
-         - Time-based interpolation for continuous variables
-         - Forward-fill for flags & categorical states
-         - No interpolation of precipitation
-    7) Optional saving of the cleaned dataset to CSV.
-
-    Original raw FM-12 string columns are preserved until explicitly
-    removed via `drop_raw_columns()`; decoded features never overwrite
-    raw data.
+    Attributes:
+        weather_dir (str): Path to the directory containing raw CSV files.
+        log (logging.Logger): Logger instance for tracking processing errors.
+        FM12_FIELDS (list): List of specific NOAA columns required for decoding.
     """
 
-    FM12_FIELDS = ["WND", "VIS", "TMP", "DEW", "SLP", "AA1",
-                   "CIG", "MA1", "OD1", "MD1"]
+    FM12_FIELDS = ["WND", "VIS", "TMP", "DEW", "SLP", "AA1", "CIG", "MA1", "OD1", "MD1"]
 
-    def __init__(self,
-                 weather_dir: str = "data/weather",
-                 verbose: bool = False):
+    def __init__(self, weather_dir: str = "data/weather", verbose: bool = False):
         """
-        Parameters
-        ----------
-        weather_dir : str
-            Directory containing NOAA ISD CSV files.
-        verbose : bool
-            If True, enables detailed logging for debugging.
-        """
+        Initializes the weather preprocessor.
 
+        Args:
+            weather_dir (str, optional): Directory containing NOAA ISD CSV files. 
+                                         Defaults to "data/weather".
+            verbose (bool, optional): If True, sets logging level to INFO. 
+                                      Defaults to False (WARNING).
+        """
         self.weather_dir = weather_dir
-
-        # Logging setup
         logging.basicConfig(
             level=logging.INFO if verbose else logging.WARNING,
             format="%(asctime)s | %(levelname)s | %(message)s",
@@ -69,30 +58,24 @@ class WeatherPreprocessor:
         )
         self.log = logging.getLogger("WeatherPreprocessor")
 
-    # ------------------------------------------------------------------
-    # STEP 1 — LOAD RAW NOAA CSV FILES
-    # ------------------------------------------------------------------
-
     def load_raw(self) -> pd.DataFrame:
         """
-        Load and merge all NOAA weather CSV files into a single dataframe.
+        Loads and merges all NOAA weather CSV files from the configured directory.
 
-        Returns
-        -------
-        pandas.DataFrame
-            Raw NOAA weather data indexed by timestamp.
+        It parses the 'DATE' column into a DatetimeIndex, removes duplicate timestamps,
+        and sorts the data chronologically.
 
-        Raises
-        ------
-        FileNotFoundError:
-            If the directory or CSV files are missing.
-        KeyError:
-            If DATE column does not exist.
-        RuntimeError:
-            If resulting dataframe is empty after DATE parsing.
+        Returns:
+            pd.DataFrame: A raw dataframe containing all columns from the CSVs, 
+                          indexed by timestamp.
+
+        Raises:
+            FileNotFoundError: If the weather directory does not exist or is empty.
+            KeyError: If the required 'DATE' column is missing from the data.
+            RuntimeError: If parsing results in an empty dataframe.
         """
         if not os.path.exists(self.weather_dir):
-            raise FileNotFoundError(f"Weather folder does not exist: {self.weather_dir}")
+            raise FileNotFoundError(f"Weather directory not found: {self.weather_dir}")
 
         csv_files = sorted(glob.glob(os.path.join(self.weather_dir, "*.csv")))
         if not csv_files:
@@ -107,78 +90,55 @@ class WeatherPreprocessor:
                 self.log.error(f"Failed to load {f}: {e}")
 
         if not frames:
-            raise RuntimeError("No CSV files could be loaded successfully.")
+            raise RuntimeError("No CSV files loaded successfully.")
 
         df = pd.concat(frames, ignore_index=True)
-
         if "DATE" not in df.columns:
-            raise KeyError("DATE column missing in NOAA dataset.")
-
+            raise KeyError("DATE column missing from NOAA dataset.")
 
         df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
-        df = df.dropna(subset=["DATE"]).sort_values("DATE")
-        df = df.drop_duplicates("DATE")
-
+        df = df.dropna(subset=["DATE"]).sort_values("DATE").drop_duplicates("DATE")
         df = df.set_index("DATE")
         df.index.name = "timestamp"
 
         if df.empty:
-            raise RuntimeError("Loaded dataframe is empty after DATE parsing.")
+            raise RuntimeError("No valid data after DATE parsing.")
 
         return df
 
-    # ------------------------------------------------------------------
-    # STEP 2 — SELECT RELEVANT FM-12 COLUMNS ONLY
-    # ------------------------------------------------------------------
-
     def select_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Keep only relevant FM-12 encoded weather fields plus STATION if present.
+        Filters the dataframe to retain only relevant FM-12 weather fields.
 
-        Parameters
-        ----------
-        df : pandas.DataFrame
-            Raw NOAA dataframe containing many unused metadata fields.
+        Args:
+            df (pd.DataFrame): The raw dataframe with all NOAA columns.
 
-        Returns
-        -------
-        pandas.DataFrame
-            Dataframe filtered to FM-12 weather columns (and STATION if present).
+        Returns:
+            pd.DataFrame: A subset of the dataframe containing only `FM12_FIELDS`.
 
-        Raises
-        ------
-        ValueError:
-            If none of the FM-12 fields are present.
+        Raises:
+            ValueError: If none of the required FM-12 columns are present.
         """
         existing = [c for c in self.FM12_FIELDS if c in df.columns]
         if not existing:
-            raise ValueError("No FM-12 weather columns found in dataset.")
+            raise ValueError("No FM-12 weather columns found.")
 
-        keep_cols = existing.copy()
-
-        return df[keep_cols].copy()
-
-    # ------------------------------------------------------------------
-    # Utility: safe splitting of encoded fields
-    # ------------------------------------------------------------------
+        return df[existing].copy()
 
     def _split(self, series: pd.Series, idx: int, missing) -> pd.Series:
         """
-        Safely splits FM-12 encoded strings like '330,1,N,0021,1'.
+        Helper method to parse comma-separated FM-12 strings.
 
-        Parameters
-        ----------
-        series : pandas.Series
-            Encoded FM-12 string column.
-        idx : int
-            Index of the component to extract.
-        missing : str or list
-            Value(s) representing missing data.
+        NOAA data often packs multiple values into one string (e.g., "330,1,N,0021,1").
+        This method extracts a specific component by index.
 
-        Returns
-        -------
-        pandas.Series
-            Extracted raw values with missing values handled safely.
+        Args:
+            series (pd.Series): The column of FM-12 strings.
+            idx (int): The zero-based index of the component to extract.
+            missing (str | list): Value(s) representing missing data to be replaced with NaN.
+
+        Returns:
+            pd.Series: A series of extracted values (as strings) with NaNs handled.
         """
         try:
             parts = series.str.split(",", expand=True)
@@ -192,408 +152,431 @@ class WeatherPreprocessor:
             self.log.warning(f"FM-12 decode error: {e}")
             return pd.Series([np.nan] * len(series), index=series.index)
 
-    # ------------------------------------------------------------------
-    # STEP 3 — DECODE ALL FM-12 FIELDS
-    # ------------------------------------------------------------------
-
     def decode(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Decode all raw FM-12 encoded weather columns.
+        Decodes FM-12 encoded columns into human-readable meteorological features.
 
-        Adds numerical features including:
-        - temperature_C, dewpoint_C, rel_humidity
-        - wind_speed_ms, wind_dir_deg
-        - visibility_m, pressure_hPa, precip_mm
-        - ceiling_m, low_ceiling_flag
-        - cloud_oktas, cloud_pct
-        - obscuration_code, obscuration_type, fog_flag
-        - snow_depth_mm, snow_flag
+        Performs extraction, scaling (e.g., dividing by 10 for temperature), and 
+        calculation of derived features (e.g., Relative Humidity via Magnus formula).
 
-        Returns
-        -------
-        pandas.DataFrame
+        Features generated:
+        - Temperature/Dewpoint (C), Relative Humidity (%)
+        - Wind Direction (deg), Speed (m/s)
+        - Visibility (m), Pressure (hPa), Precipitation (mm)
+        - Cloud Cover (oktas & %), Ceiling Height (m)
+
+        Args:
+            df (pd.DataFrame): The dataframe with raw FM-12 string columns.
+
+        Returns:
+            pd.DataFrame: A copy of the input dataframe with new decoded feature columns.
         """
         out = df.copy()
 
-        # ---------------- Temperature ----------------
-        if "TMP" in df.columns:
-            try:
-                out["temperature_C"] = (
-                    self._split(df["TMP"], 0, "99999").astype(float) / 10.0
-                )
-            except Exception:
-                out["temperature_C"] = np.nan
+        # Temperature (°C, /10 from encoded)
+        if "TMP" in df:
+            out["temperature_C"] = self._split(df["TMP"], 0, "99999").astype(float) / 10.0
 
-        # ---------------- Dewpoint ----------------
-        if "DEW" in df.columns:
-            try:
-                out["dewpoint_C"] = (
-                    self._split(df["DEW"], 0, "99999").astype(float) / 10.0
-                )
-            except Exception:
-                out["dewpoint_C"] = np.nan
+        # Dewpoint (°C, /10 from encoded)
+        if "DEW" in df:
+            out["dewpoint_C"] = self._split(df["DEW"], 0, "99999").astype(float) / 10.0
 
-        # ---------------- Relative humidity (initial) ----------------
-        try:
-            T = out.get("temperature_C")
-            Td = out.get("dewpoint_C")
-            if T is not None and Td is not None:
-                with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
-                    rh = (100.0 *
-                          np.exp((17.625 * Td) / (243.04 + Td)) /
-                          np.exp((17.625 * T) / (243.04 + T)))
+        # Relative humidity (Magnus formula)
+        T, Td = out.get("temperature_C"), out.get("dewpoint_C")
+        if T is not None and Td is not None:
+            with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+                rh = 100.0 * np.exp((17.625 * Td) / (243.04 + Td)) / np.exp((17.625 * T) / (243.04 + T))
                 out["rel_humidity"] = rh.clip(0, 100)
-        except Exception as e:
-            self.log.warning(f"Initial RH calculation failed: {e}")
-            out["rel_humidity"] = np.nan
 
-        # ---------------- Wind ----------------
-        if "WND" in df.columns:
+        # Wind (dir index 0, speed index 3 /10)
+        if "WND" in df:
             try:
-                parts = df["WND"].str.split(",", expand=True)
-                out["wind_dir_deg"] = parts[0].replace("999", np.nan).astype(float)
-                out["wind_speed_ms"] = parts[3].replace("9999", np.nan).astype(float) / 10.0
+                parts = df["WND"].str.split(",", expand=True, n=4)
+                out["wind_dir_deg"] = pd.to_numeric(parts[0].replace("999", np.nan), errors='coerce')
+                out["wind_speed_ms"] = pd.to_numeric(parts[3].replace("9999", np.nan), errors='coerce') / 10.0
             except Exception:
                 out["wind_dir_deg"] = np.nan
                 out["wind_speed_ms"] = np.nan
 
-        # ---------------- Visibility ----------------
-        if "VIS" in df.columns:
-            try:
-                out["visibility_m"] = (
-                    self._split(df["VIS"], 0, ["999999", "99999"]).astype(float)
-                )
-            except Exception:
-                out["visibility_m"] = np.nan
+        # Visibility (meters)
+        if "VIS" in df:
+            out["visibility_m"] = self._split(df["VIS"], 0, ["999999", "99999"]).astype(float)
 
-        # ---------------- Sea-level Pressure ----------------
-        if "SLP" in df.columns:
-            try:
-                out["pressure_hPa"] = (
-                    self._split(df["SLP"], 0, "99999").astype(float) / 10.0
-                )
-            except Exception:
-                out["pressure_hPa"] = np.nan
+        # Pressure (hPa, /10 from encoded)
+        if "SLP" in df:
+            out["pressure_hPa"] = self._split(df["SLP"], 0, "99999").astype(float) / 10.0
 
-        # ---------------- Precipitation (AA1) ----------------
-        if "AA1" in df.columns:
-            try:
-                # AA1,1,mm,period,quality   → we usually want the amount (index 1)
-                out["precip_mm"] = (
-                    self._split(df["AA1"], 1, "9999").astype(float)
-                )
-            except Exception:
-                out["precip_mm"] = np.nan
+        # Precipitation (mm, AA1 index 1)
+        if "AA1" in df:
+            out["precip_mm"] = self._split(df["AA1"], 1, "9999").astype(float)
 
-        # ---------------- Ceiling height ----------------
-        if "CIG" in df.columns:
-            try:
-                cig = self._split(df["CIG"], 0, "99999").astype(float)
-                out["ceiling_m"] = cig * 10.0
-                out["low_ceiling_flag"] = (out["ceiling_m"] < 200).astype(float)
-            except Exception:
-                out["ceiling_m"] = np.nan
-                out["low_ceiling_flag"] = np.nan
+        # Ceiling (meters * 10)
+        if "CIG" in df:
+            cig = self._split(df["CIG"], 0, "99999").astype(float)
+            out["ceiling_m"] = cig * 10.0
+            out["low_ceiling_flag"] = (out["ceiling_m"] < 200).astype(float)
 
-        # ---------------- Cloud amount (MA1) ----------------
-        if "MA1" in df.columns:
-            try:
-                okta = self._split(df["MA1"], 0, "99").astype(float)
-                out["cloud_oktas"] = okta
-                out["cloud_pct"] = (okta / 8.0) * 100.0
-            except Exception:
-                out["cloud_oktas"] = np.nan
-                out["cloud_pct"] = np.nan
+        # Cloud cover (oktas → %)
+        if "MA1" in df:
+            okta = self._split(df["MA1"], 0, "99").astype(float)
+            out["cloud_oktas"] = okta
+            out["cloud_pct"] = (okta / 8.0) * 100.0
 
-        # ---------------- Obscuration (fog / haze) (OD1) ----------------
-        if "OD1" in df.columns:
-            try:
-                code = self._split(df["OD1"], 0, "99").astype(float)
-                out["obscuration_code"] = code
-                mapping = {
-                    1: "fog",
-                    2: "mist",
-                    3: "smoke",
-                    4: "haze",
-                    5: "dust",
-                    6: "sand",
-                    7: "spray",
-                    9: "other",
-                }
-                out["obscuration_type"] = out["obscuration_code"].map(mapping)
-                out["fog_flag"] = (out["obscuration_code"] == 1).astype(float)
-            except Exception:
-                out["obscuration_code"] = np.nan
-                out["obscuration_type"] = np.nan
-                out["fog_flag"] = np.nan
+        # Obscuration (fog/haze codes)
+        if "OD1" in df:
+            code = self._split(df["OD1"], 0, "99").astype(float)
+            out["obscuration_code"] = code
+            mapping = {1: "fog", 2: "mist", 3: "smoke", 4: "haze", 5: "dust", 6: "sand", 7: "spray", 9: "other"}
+            out["obscuration_type"] = out["obscuration_code"].map(mapping)
+            out["fog_flag"] = (code == 1).astype(float)
 
-        # ---------------- Snow depth (MD1) ----------------
-        if "MD1" in df.columns:
-            try:
-                snow = self._split(df["MD1"], 0, ["999", "99"]).astype(float)
-                out["snow_depth_mm"] = snow
-                out["snow_flag"] = (snow > 0).astype(float)
-            except Exception:
-                out["snow_depth_mm"] = np.nan
-                out["snow_flag"] = np.nan
+        # Snow depth (mm)
+        if "MD1" in df:
+            snow = self._split(df["MD1"], 0, ["999", "99"]).astype(float)
+            out["snow_depth_mm"] = snow
+            out["snow_flag"] = (snow > 0).astype(float)
 
         return out
 
-    # METEOROLOGICAL CLEANING & OUTLIER HANDLING
-
     def clean_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Apply meteorological cleaning and outlier handling.
-        PLATINUM VERSION: Hard-clips Temperatures and Back-fills missing starts.
+        Applies meteorological consistency checks and handles outliers.
+
+        Enforces physical laws and cleans data anomalies:
+        - **Precipitation:** Clipped to [0, 50mm].
+        - **Ceiling:** Infers values based on Fog (50m) or Clear Sky (20km).
+        - **Thermodynamics:** Ensures Dewpoint <= Temperature.
+        - **Outliers:** Applies IQR clipping for extreme UK temperatures.
+        - **Filling:** Uses forward/backward fill to handle missing steps.
+
+        Args:
+            df (pd.DataFrame): The dataframe containing decoded features.
+
+        Returns:
+            pd.DataFrame: A cleaned dataframe with no NaNs and physically consistent values.
         """
         df = df.copy()
 
-        # 1. PRECIPITATION FIX
-        df["precip_mm"] = df.get("precip_mm", 0).fillna(0).astype(float)
-        df["precip_mm"] = df["precip_mm"].clip(0, 50) 
+        # Precipitation (non-negative, realistic max)
+        df["precip_mm"] = df.get("precip_mm", 0).fillna(0).clip(0, 50)
         df["rain_flag"] = (df["precip_mm"] > 0).astype(float)
 
-        # 2. CEILING HEIGHT FIX
+        # Ceiling height (meteorological logic)
         df["ceiling_m"] = df.get("ceiling_m", np.nan).astype(float)
+        df.loc[df["ceiling_m"] > 20000, "ceiling_m"] = 20000  # Unlimited → 20km
         
-        # Replace 'Unlimited' codes (> 20000) with 20000
-        df.loc[df["ceiling_m"] > 20000, "ceiling_m"] = 20000
+        # Fog implies low ceiling, clear sky implies high ceiling
+        fog_low = df["ceiling_m"].isna() & (df.get("fog_flag", 0) == 1)
+        df.loc[fog_low, "ceiling_m"] = 50.0
+        clear_sky = df["ceiling_m"].isna() & (df.get("cloud_oktas", np.nan) == 0)
+        df.loc[clear_sky, "ceiling_m"] = 20000.0
         
-        # Handle logic for missing ceiling
-        fog_low = df["ceiling_m"].isna() & (df["fog_flag"] == 1)
-        df.loc[fog_low, "ceiling_m"] = 50.0  # Dense fog = low ceiling
-
-        df["cloud_oktas"] = df.get("cloud_oktas", np.nan).astype(float)
-        clear_sky = df["ceiling_m"].isna() & (df["cloud_oktas"] == 0)
-        df.loc[clear_sky, "ceiling_m"] = 20000.0 # Clear sky = max ceiling
-
-        # INTERPOLATION FIX: Forward Fill AND Back Fill (for the first few rows)
         df["ceiling_m"] = df["ceiling_m"].ffill().bfill()
-
-        # Recalculate Ceiling Category
-        df["ceiling_category"] = pd.cut(
-            df["ceiling_m"],
-            bins=[-1, 200, 500, 1000, 25000], 
-            labels=["LIFR", "IFR", "MVFR", "VFR"]
-        )
-        # Fill any remaining category NaNs (rare) with VFR
-        df["ceiling_category"] = df["ceiling_category"].fillna("VFR")
-        
+        df["ceiling_category"] = pd.cut(df["ceiling_m"], bins=[-1, 200, 500, 1000, 25000],
+                                       labels=["LIFR", "IFR", "MVFR", "VFR"]).fillna("VFR")
         df["low_ceiling_flag"] = (df["ceiling_m"] < 200).astype(float)
 
-        # 3. OTHER CHECKS (Standard)
-        df["obscuration_type"] = df.get("obscuration_type", np.nan).fillna("none")
-        df["obscuration_code"] = df.get("obscuration_code", 0).fillna(0).astype(float)
-        df["fog_flag"] = df.get("fog_flag", 0).fillna(0).astype(float)
-
-        df["snow_depth_mm"] = df.get("snow_depth_mm", np.nan).astype(float)
-        df["snow_depth_mm"] = df["snow_depth_mm"].clip(lower=0)
-        df["snow_flag"] = df.get("snow_flag", 0).fillna(0).astype(float)
-
-        # Temperature / Dewpoint Consistency
+        # Temperature/Dewpoint physics (Td ≤ T)
         df["temperature_C"] = df.get("temperature_C", np.nan).astype(float)
         df["dewpoint_C"] = df.get("dewpoint_C", np.nan).astype(float)
-
-        # Fix Td > T
         missing_T = df["temperature_C"].isna() & df["dewpoint_C"].notna()
         df.loc[missing_T, "temperature_C"] = df.loc[missing_T, "dewpoint_C"] + 2.0
-        
         missing_Td = df["dewpoint_C"].isna() & df["temperature_C"].notna()
         df.loc[missing_Td, "dewpoint_C"] = df.loc[missing_Td, "temperature_C"] - 2.0
+
+        # Physical limits
+        df["wind_speed_ms"] = df.get("wind_speed_ms", np.nan).astype(float).clip(0, 100)
+        df["wind_dir_deg"] = df.get("wind_dir_deg", np.nan).astype(float).clip(0, 360)
+        df["visibility_m"] = df.get("visibility_m", np.nan).astype(float).clip(0, 100000)
+        df["pressure_hPa"] = df.get("pressure_hPa", np.nan).astype(float).clip(800, 1100)
         
-        # 4. PHYSICAL ANOMALIES (Hard Limits)
-        # Wind
-        df["wind_speed_ms"] = df.get("wind_speed_ms", np.nan).astype(float)
-        df.loc[(df["wind_speed_ms"] < 0) | (df["wind_speed_ms"] > 100), "wind_speed_ms"] = np.nan
-        
-        df["wind_dir_deg"] = df.get("wind_dir_deg", np.nan).astype(float)
-        df.loc[(df["wind_dir_deg"] < 0) | (df["wind_dir_deg"] > 360), "wind_dir_deg"] = np.nan
-
-        # Visibility
-        df["visibility_m"] = df.get("visibility_m", np.nan).astype(float)
-        df.loc[df["visibility_m"] < 0, "visibility_m"] = np.nan
-        df.loc[df["visibility_m"] > 100000, "visibility_m"] = 100000 
-
-        # Pressure
-        df["pressure_hPa"] = df.get("pressure_hPa", np.nan).astype(float)
-        df.loc[(df["pressure_hPa"] < 800) | (df["pressure_hPa"] > 1100), "pressure_hPa"] = np.nan
-
-        # 5. OUTLIER CLIPPING (IQR + HARD SAFETY)
+        # UK-specific temperature limits + outlier clipping
         def iqr_clip(series, k=3.0):
-            if series.dropna().empty: return series
-            q1, q3 = series.quantile([0.05, 0.95]) 
+            if series.dropna().empty:
+                return series
+            q1, q3 = series.quantile([0.05, 0.95])
             iqr = q3 - q1
-            lower = q1 - k * iqr
-            upper = q3 + k * iqr
-            return series.clip(lower, upper)
+            return series.clip(q1 - k * iqr, q3 + k * iqr)
 
-        df["temperature_C"] = iqr_clip(df["temperature_C"])
-        df["dewpoint_C"] = iqr_clip(df["dewpoint_C"])
-        df["pressure_hPa"] = iqr_clip(df["pressure_hPa"])
+        df["temperature_C"] = iqr_clip(df["temperature_C"]).clip(-30, 40)
+        df["dewpoint_C"] = iqr_clip(df["dewpoint_C"]).clip(-30, 40)
+        df.loc[df["dewpoint_C"] > df["temperature_C"], "dewpoint_C"] = df["temperature_C"]
 
-        # *** FINAL SAFETY CLIP *** # Force clamp Temperature to UK Realistic Limits (-30 to +40)
-        # This fixes the specific warning from the Audit Script.
-        df["temperature_C"] = df["temperature_C"].clip(-30, 40)
-        df["dewpoint_C"] = df["dewpoint_C"].clip(-30, 40)
-
-        # Ensure Dewpoint <= Temp again after clipping
-        dewpoint_too_high = df["dewpoint_C"] > df["temperature_C"]
-        df.loc[dewpoint_too_high, "dewpoint_C"] = df.loc[dewpoint_too_high, "temperature_C"]
-
-        # 6. Cloudiness
-        df["cloud_oktas"] = df["cloud_oktas"].clip(0, 8)
+        # Cloud cover consistency
+        df["cloud_oktas"] = df.get("cloud_oktas", np.nan).clip(0, 8)
         df["cloud_pct"] = (df["cloud_oktas"] / 8.0) * 100.0
 
-        # 7. Final Recalculation of RH
+        # Recalculate RH and finalize flags
         with np.errstate(all='ignore'):
-            T = df["temperature_C"]
-            Td = df["dewpoint_C"]
+            T, Td = df["temperature_C"], df["dewpoint_C"]
             rh = 100.0 * np.exp((17.625 * Td) / (243.04 + Td)) / np.exp((17.625 * T) / (243.04 + T))
-        df["rel_humidity"] = rh.clip(0, 100)
+            df["rel_humidity"] = rh.clip(0, 100)
 
-        # 8. Final Flags
         for col in ["fog_flag", "snow_flag", "low_ceiling_flag", "rain_flag"]:
             df[col] = df.get(col, 0).fillna(0).astype(float)
-            
-        # 9. Final Nan Check (Backfill everything one last time)
-        # This catches the first 32 rows if they were missing
-        df = df.ffill().bfill()
 
-        return df
+        df["obscuration_type"] = df.get("obscuration_type", "none").fillna("none")
+        df["snow_depth_mm"] = df.get("snow_depth_mm", 0).clip(lower=0)
 
-    #  RESAMPLE TO 15-MINUTE INTERVALS
+        return df.ffill().bfill()
 
-    def resample(self, df: pd.DataFrame) -> pd.DataFrame:
+    def resample(self, df: pd.DataFrame, freq: str = "15min") -> pd.DataFrame:
         """
-        Resample the weather dataset to 15-minute intervals.
+        Resamples the weather dataset to a regular time grid (default 15 mins).
 
-        Continuous features use time-based interpolation.
-        Categorical / binary features are forward-filled.
-        Precipitation is NOT interpolated (step-wise behaviour).
+        Strategy:
+        - **Continuous (Temp, Wind):** Interpolated over time.
+        - **Accumulation (Precipitation):** Forward-filled, then gaps assumed 0.
+        - **Categorical (Flags):** Forward-filled (persistence model).
+        - **Derived (Humidity):** Re-calculated after interpolation to maintain physics.
 
-        Returns
-        -------
-        pandas.DataFrame
+        Args:
+            df (pd.DataFrame): Cleaned weather data with a DatetimeIndex.
+            freq (str, optional): Target frequency string. Defaults to "15min".
+
+        Returns:
+            pd.DataFrame: The resampled dataframe aligned to the target grid.
         """
         if df.empty:
-            raise ValueError("Cannot resample an empty dataframe.")
+            raise ValueError("Cannot resample empty dataframe.")
 
-        # Create a regular 15-min grid
-        df15 = df.resample("15min").asfreq()
+        df15 = df.resample(freq).asfreq()
 
         continuous = [
-            "temperature_C", "dewpoint_C", "rel_humidity",
-            "wind_dir_deg", "wind_speed_ms",
-            "visibility_m", "pressure_hPa",
-            "ceiling_m", "cloud_oktas", "cloud_pct",
-            "snow_depth_mm"
+            "temperature_C", "dewpoint_C", "rel_humidity", "wind_dir_deg",
+            "wind_speed_ms", "visibility_m", "pressure_hPa", "ceiling_m",
+            "cloud_oktas", "cloud_pct", "snow_depth_mm"
         ]
 
-        # Precip handled separately (no interpolation)
-        precip_col = "precip_mm"
-
-        flags = ["low_ceiling_flag", "fog_flag", "snow_flag", "rain_flag"]
-        categorical = ["obscuration_type", "ceiling_category", "obscuration_code"]
-
-        # ---- Continuous: true temporal interpolation ----
-        for c in continuous:
-            if c in df15.columns:
-                df15[c] = pd.to_numeric(df15[c], errors="coerce")
-                df15[c] = df15[c].interpolate(
-                    method="time",
-                    limit_direction="both"
+        for col in continuous:
+            if col in df15:
+                df15[col] = pd.to_numeric(df15[col], errors="coerce").interpolate(
+                    method="time", limit_direction="both"
                 )
 
-        # ---- Precipitation: step-wise / forward-fill, then fill NaN with 0 ----
-        if precip_col in df15.columns:
-            df15[precip_col] = pd.to_numeric(df15[precip_col], errors="coerce")
-            df15[precip_col] = df15[precip_col].ffill().fillna(0.0)
+        if "precip_mm" in df15:
+            df15["precip_mm"] = pd.to_numeric(df15["precip_mm"], errors="coerce").ffill().fillna(0)
 
-        # ---- Flags: forward-fill ----
-        for f in flags:
-            if f in df15.columns:
-                df15[f] = df15[f].ffill().fillna(0.0).astype(float)
+        for col in ["low_ceiling_flag", "fog_flag", "snow_flag", "rain_flag",
+                    "obscuration_type", "ceiling_category"]:
+            if col in df15:
+                df15[col] = df15[col].ffill()
 
-        # ---- Categorical: forward-fill ----
-        for cat in categorical:
-            if cat in df15.columns:
-                df15[cat] = df15[cat].ffill()
-
-        # ---- Cloud okta integer & cloud percentage consistency ----
-        if "cloud_oktas" in df15.columns:
+        if "cloud_oktas" in df15:
             df15["cloud_oktas"] = df15["cloud_oktas"].round().clip(0, 8)
             df15["cloud_pct"] = (df15["cloud_oktas"] / 8.0) * 100.0
 
-        # ---- Recompute RH after interpolation (final consistency) ----
-        if "temperature_C" in df15.columns and "dewpoint_C" in df15.columns:
-            with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
-                T = df15["temperature_C"]
-                Td = df15["dewpoint_C"]
-                rh = (
-                    100.0 *
-                    np.exp((17.625 * Td) / (243.04 + Td)) /
-                    np.exp((17.625 * T) / (243.04 + T))
-                )
-            df15["rel_humidity"] = rh.clip(0, 100)
+        if all(col in df15 for col in ["temperature_C", "dewpoint_C"]):
+            with np.errstate(all="ignore"):
+                T, Td = df15["temperature_C"], df15["dewpoint_C"]
+                rh = 100.0 * np.exp((17.625 * Td) / (243.04 + Td)) / np.exp((17.625 * T) / (243.04 + T))
+                df15["rel_humidity"] = rh.clip(0, 100)
 
         return df15
 
-    # ------------------------------------------------------------------
-    # STEP 6 — DROP RAW FM-12 COLUMNS
-    # ------------------------------------------------------------------
-
     def drop_raw_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Remove original FM-12 string fields after decoding.
+        Removes the original FM-12 string columns from the dataframe.
 
-        These columns are not usable for modelling and should be
-        removed once the numerical decoded features are generated.
+        Args:
+            df (pd.DataFrame): The dataframe containing both raw and processed columns.
+
+        Returns:
+            pd.DataFrame: Dataframe with only the cleaned, numeric feature columns.
         """
-        raw_cols = self.FM12_FIELDS
-        df_clean = df.drop(columns=[c for c in raw_cols if c in df.columns])
-        return df_clean
+        raw_cols = [c for c in self.FM12_FIELDS if c in df.columns]
+        return df.drop(columns=raw_cols)
 
-    # ------------------------------------------------------------------
-    # STEP 7 — FINAL PIPELINE
-    # ------------------------------------------------------------------
-
-    def run(self, save_path: str | None = None) -> pd.DataFrame:
+    def run(self, freq: str = '15min', save_path: str | None = None) -> pd.DataFrame:
         """
-        Run the full weather preprocessing pipeline.
+        Executes the full weather preprocessing pipeline.
 
-        Parameters
-        ----------
-        save_path : str, optional
-            If provided, the clean dataset will be exported to CSV.
-Ò
-        Returns
-        -------
-        pandas.DataFrame
-            Fully decoded, cleaned, resampled weather dataset.
+        Steps: Load -> Select FM-12 -> Decode -> Clean -> Drop Raw -> Resample.
+
+        Args:
+            freq (str, optional): Target frequency for resampling. Defaults to '15min'.
+            save_path (str | None, optional): If provided, saves the result to this CSV path.
+
+        Returns:
+            pd.DataFrame: The final processed weather dataset.
         """
         df = self.load_raw()
         df = self.select_columns(df)
         df = self.decode(df)
         df = self.clean_features(df)
         df = self.drop_raw_columns(df)
-        df = self.resample(df)
+        df = self.resample(df, freq)
 
         if save_path:
+            df.to_csv(save_path)
+            self.log.info(f"Weather data saved: {save_path}")
+        return df
+
+
+class TrafficPreprocessor:
+    """
+    Handles loading, standardizing, and aggregating traffic sensor data.
+
+    This class is responsible for:
+    1.  Loading raw traffic CSVs.
+    2.  Standardizing column names (e.g., 'Total Volume' -> 'total_volume').
+    3.  Creating a unified DatetimeIndex.
+    4.  Aggregating data from multiple sensors (handling outages via mean aggregation).
+
+    Attributes:
+        data_dir (str): Directory containing traffic data CSVs.
+    """
+
+    def __init__(self, data_dir: str = "data/traffic"):
+        """
+        Args:
+            data_dir (str, optional): Path to traffic data. Defaults to "data/traffic".
+        """
+        self.data_dir = data_dir
+
+    # 1) LOADING ONLY
+    def load_raw(self) -> pd.DataFrame | None:
+        """
+        Loads and concatenates raw traffic CSV files.
+
+        Returns:
+            pd.DataFrame | None: Concatenated raw data, or None if no files found.
+        """
+        data_dir = self.data_dir
+
+        if not os.path.exists(data_dir):
+            print(f"❌ Error: Directory '{data_dir}' not found.")
+            return None
+
+        csv_files = glob.glob(os.path.join(data_dir, "*.csv"))
+        if not csv_files:
+            print("❌ Error: No CSV files found.")
+            return None
+
+        print(f"📂 Found {len(csv_files)} traffic files. Loading...")
+
+        df_list = []
+        for f in csv_files:
             try:
-                df.to_csv(save_path)
-                self.log.info(f"Saved cleaned weather file → {save_path}")
+                temp_df = pd.read_csv(f)
+                cols_to_drop = [
+                    c for c in temp_df.columns
+                    if "timestamp" in c.lower() or "unnamed" in c.lower()
+                ]
+                if cols_to_drop:
+                    temp_df.drop(columns=cols_to_drop, inplace=True)
+                df_list.append(temp_df)
             except Exception as e:
-                self.log.error(f"Failed to save CSV: {e}")
+                print(f"⚠️ Warning: Could not read {f}. Reason: {e}")
+
+        if not df_list:
+            return None
+
+        return pd.concat(df_list, ignore_index=True)
+
+    # 2) STANDARDISATION
+    def standardise(self, raw_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Standardises column names and constructs a clean DatetimeIndex.
+
+        Parses 'Report Date' and 'Time Period Ending' into a single 'timestamp'.
+
+        Args:
+            raw_df (pd.DataFrame): The raw loaded dataframe.
+
+        Returns:
+            pd.DataFrame: Dataframe with 'timestamp' index and standard column names.
+        """
+        df = raw_df.copy()
+
+        # Parse timestamps
+        df["timestamp"] = pd.to_datetime(
+            df["Report Date"] + " " + df["Time Period Ending"],
+            dayfirst=True,
+            errors="coerce",
+        )
+        df = df.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
+
+        # Standardise column names
+        if "Total Volume" in df.columns:
+            df = df.rename(columns={"Total Volume": "total_volume"})
+        if "Avg mph" in df.columns:
+            df = df.rename(columns={"Avg mph": "avg_mph"})
 
         return df
-    
 
-def process_and_merge(traffic_df: pd.DataFrame, weather_df: pd.DataFrame):
+    # 3) TREATMENT / CLEANING
+    def process(self, std_df: pd.DataFrame, freq: str = "15min") -> pd.DataFrame | None:
+        """
+        Aggregates sensor data and resamples to a regular grid.
+
+        - **Aggregation:** Uses MEAN to combine multiple sensors (robust to single sensor outages).
+        - **Resampling:** Defaults to MEAN for 15-minute intervals.
+
+        Args:
+            std_df (pd.DataFrame): Standardized dataframe.
+            freq (str, optional): Target frequency. Defaults to "15min".
+
+        Returns:
+            pd.DataFrame | None: Final processed traffic data with index reset.
+        """
+        try:
+            df = std_df.copy()
+
+            print("   > Aggregating multiple sensors (Using Mean to handle outages)...")
+            grouped_df = df.groupby(df.index).agg({
+                "total_volume": "mean" if freq == "15min" else "sum",
+                "avg_mph": "mean",
+            })
+
+            final_df = grouped_df.resample(freq).mean()
+
+            print(f"✅ Traffic Data Processed. Rows: {len(final_df)}")
+            return final_df.reset_index()
+
+        except Exception as e:
+            print(f"❌ Critical Error during processing: {e}")
+            return None
+
+    # 4) CONVENIENCE WRAPPER
+    def load_traffic_data(self, freq: str = "15min") -> pd.DataFrame | None:
+        """
+        Executes the full traffic pipeline: Load -> Standardise -> Process.
+
+        Args:
+            freq (str, optional): Target frequency. Defaults to "15min".
+
+        Returns:
+            pd.DataFrame | None: The final processed traffic dataset.
+        """
+        raw_df = self.load_raw()
+        if raw_df is None:
+            return None
+        std_df = self.standardise(raw_df)
+        return self.process(std_df)
+
+
+def process_and_merge(traffic_df: pd.DataFrame, weather_df: pd.DataFrame, freq: str = "15min") -> pd.DataFrame:
     """
-    Merge 15-minute traffic data with processed 15-minute weather.
-    
-    FIX: Prevents 'Target Leakage' by ensuring we do not forward-fill 
-    missing traffic data, only weather data.
+    Merges traffic and weather data onto a unified time grid.
+
+    Strategy:
+    1.  **Traffic (Target):** Resampled via `asfreq()`. Gaps remain NaN (no artificial targets).
+    2.  **Weather (Features):** Resampled and Forward-Filled (atmosphere evolves continuously).
+    3.  **Merge:** Left Join onto Traffic timestamps.
+    4.  **Leakage Prevention:** Weather is forward-filled *after* join with a limit of 2 steps.
+
+    Args:
+        traffic_df (pd.DataFrame): Processed traffic data.
+        weather_df (pd.DataFrame): Processed weather data.
+        freq (str, optional): Target frequency. Defaults to "15min".
+
+    Returns:
+        pd.DataFrame: The merged dataset ready for model training.
+
+    Raises:
+        ValueError: If inputs are empty.
+        RuntimeError: If merging fails.
     """
     if traffic_df is None or traffic_df.empty:
         raise ValueError("traffic_df is empty.")
@@ -604,12 +587,13 @@ def process_and_merge(traffic_df: pd.DataFrame, weather_df: pd.DataFrame):
     try:
         traffic_df = traffic_df.copy()
         if "timestamp" in traffic_df.columns:
-            traffic_df["timestamp"] = pd.to_datetime(traffic_df["timestamp"], errors="coerce")
+            traffic_df["timestamp"] = pd.to_datetime(
+                traffic_df["timestamp"], errors="coerce"
+            )
             traffic_df = traffic_df.dropna(subset=["timestamp"]).set_index("timestamp")
-        
+
         traffic_df = traffic_df.sort_index()
-        # Ensure distinct 15min grid
-        traffic_df = traffic_df.resample("15min").asfreq()
+        traffic_df = traffic_df.resample(freq).asfreq()
     except Exception as e:
         raise RuntimeError(f"Traffic timestamp processing failed: {e}")
 
@@ -618,26 +602,20 @@ def process_and_merge(traffic_df: pd.DataFrame, weather_df: pd.DataFrame):
         weather_df = weather_df.copy()
         weather_df.index = pd.to_datetime(weather_df.index, errors="coerce")
         weather_df = weather_df.sort_index()
-        # Weather is allowed to be forward filled (atmosphere changes slowly)
-        weather_df = weather_df.resample("15min").ffill()
+        weather_df = weather_df.resample(freq).ffill()
     except Exception as e:
         raise RuntimeError(f"Weather timestamp processing failed: {e}")
 
     # 3. Merge
     try:
-        # Left join: We only care about times where we have TRAFFIC data
         merged = traffic_df.join(weather_df, how="left")
-        
-        # FIX: Fill only weather columns, NOT traffic columns
+
         weather_cols = weather_df.columns
         merged[weather_cols] = merged[weather_cols].ffill(limit=2)
 
-        # Sanity Check: Clip negatives (just in case)
         if "total_volume" in merged.columns:
             merged["total_volume"] = merged["total_volume"].clip(lower=0)
-
     except Exception as e:
         raise RuntimeError(f"Failed to merge weather + traffic: {e}")
 
     return merged
->>>>>>> modules/preprocessing.py
