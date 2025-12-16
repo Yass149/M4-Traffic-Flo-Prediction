@@ -17,6 +17,8 @@ from statsmodels.tsa.stattools import adfuller
 from statsmodels.tsa.arima.model import ARIMA
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
+from .preprocessing import WeatherPreprocessor,TrafficPreprocessor,process_and_merge
+
 warnings.filterwarnings("ignore")
 
 # ============================================================================
@@ -58,6 +60,14 @@ def stl_decompose(series, period=24):
     stl = STL(series, period=period, robust=True)
     result = stl.fit()
     return result
+
+
+def merge_freq(freq):
+    traffic_freq = TrafficPreprocessor().load_traffic_data(freq="1h")
+    weather_freq = WeatherPreprocessor().run(freq="1h")
+    return process_and_merge(freq="1h",traffic_df=traffic_freq,weather_df=weather_freq)
+
+
 
 # ============================================================================
 # 2. CORE BUILDERS

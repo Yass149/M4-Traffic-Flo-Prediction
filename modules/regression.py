@@ -1,3 +1,20 @@
+"""
+Traffic Regression Module.
+
+This module encapsulates the machine learning logic for traffic volume prediction
+using linear models. It handles the end-to-end regression pipeline, including:
+1.  Data Preprocessing: Handling missing values, scaling, and one-hot encoding.
+2.  Feature Engineering: Creating interaction terms (e.g., Weekly Profiles).
+3.  Model Training: Implementing Linear, Ridge, and Lasso regression.
+4.  Hyperparameter Tuning: Using Grid Search with Time Series Cross-Validation.
+5.  Evaluation: Calculating RMSE, MAE, and R2 scores with post-processing (negative clipping).
+
+Dependencies:
+    - pandas
+    - numpy
+    - sklearn (model_selection, linear_model, preprocessing, compose, impute, pipeline, metrics)
+"""
+
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
@@ -10,15 +27,36 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
 class TrafficRegressor:
     """
-    Handles training, tuning, and evaluation of Regression models.
-    
-    PLATINUM VERSION:
-    - Restores the 'Weekly Interaction' (Day + Hour) strategy (R2 ~ 0.76).
-    - Includes 'Negative Clipping' to fix graphs.
-    - Optimized Alpha Grid for maximum accuracy.
+    A unified interface for training, tuning, and evaluating traffic regression models.
+
+    This class standardizes the regression workflow. It manages dataset preparation,
+    constructs scikit-learn pipelines for various algorithms, and executes rigorous
+    evaluation strategies suitable for time-series data.
+
+    Attributes:
+        df (pd.DataFrame): The preprocessed training dataset.
+        target_col (str): The name of the target variable column (default: 'total_volume').
+        models (dict): A dictionary storing trained model objects (keys: model names).
+        X (pd.DataFrame): The feature matrix.
+        y (pd.Series): The target vector.
+        cv_split (TimeSeriesSplit): The cross-validation splitting strategy.
     """
 
-    def __init__(self, df, target_col='total_volume'):
+    def __init__(self, df: pd.DataFrame, target_col: str = 'total_volume'):
+        """
+        Initializes the TrafficRegressor and performs initial feature engineering.
+
+        The initialization process includes:
+        1. Dropping rows where the target variable is missing.
+        2. Creating a 'weekly_profile' interaction feature (Day + Hour + School Status).
+        3. Separating features (X) and target (y).
+        4. Setting up a TimeSeriesSplit for validation.
+
+        Args:
+            df (pd.DataFrame): The input dataframe containing traffic data and features.
+            target_col (str, optional): The name of the target column to predict. 
+                                        Defaults to 'total_volume'.
+        """
         self.df = df.copy()
         self.target_col = target_col
         self.models = {}
@@ -50,9 +88,22 @@ class TrafficRegressor:
         # 4. VALIDATION
         self.cv_split = TimeSeriesSplit(n_splits=5)
 
-    def _get_preprocessor(self, aggressive=False):
+    def _get_preprocessor(self, aggressive: bool = False) -> ColumnTransformer:
         """
-        Smart Preprocessor.
+        Constructs a scikit-learn ColumnTransformer for data preprocessing.
+
+        This method dynamically selects features based on the 'aggressive' flag.
+        - Standard Mode: Uses separate 'hour', 'day_of_week', and 'day_type'.
+        - Aggressive Mode: Uses the combined 'weekly_profile' interaction feature 
+          for higher granularity (often yields better R2 scores).
+
+        Args:
+            aggressive (bool, optional): If True, uses the 'weekly_profile' interaction 
+                                         feature instead of individual time components. 
+                                         Defaults to False.
+
+        Returns:
+            ColumnTransformer: A configured preprocessor object ready for a Pipeline.
         """
         # 1. Determine Categorical Strategy
         if aggressive and 'weekly_profile' in self.X.columns:
@@ -84,7 +135,12 @@ class TrafficRegressor:
         return preprocessor
 
     def run_linear_baseline(self):
-        """Standard Linear Regression."""
+        """
+        Trains a baseline Linear Regression model.
+
+        Uses the standard feature set (non-aggressive preprocessing). The result
+        is stored in the `self.models` dictionary under the key 'Linear'.
+        """
         print(f"Regression: Training Baseline Linear Model...")
         pipeline = Pipeline([
             ('preprocessor', self._get_preprocessor(aggressive=False)),
@@ -96,7 +152,11 @@ class TrafficRegressor:
 
     def run_ridge_tuning(self):
         """
-        Ridge Regression with Weekly Interaction Profile.
+        Trains and tunes a Ridge Regression model using GridSearchCV.
+
+        Uses the 'Aggressive' preprocessing strategy (Weekly Interaction Profile)
+        to capture complex time-based patterns. It optimizes the 'alpha' regularization
+        parameter to prevent overfitting.
         """
         print("Regression: Tuning Ridge Model (Weekly Interaction Strategy)...")
         
@@ -123,7 +183,13 @@ class TrafficRegressor:
         print(f"Regression: Ridge Tuned. Best Alpha: {grid.best_params_['model__alpha']}")
 
     def run_lasso_tuning(self):
-        """Lasso Regression (Feature Selection)."""
+        """
+        Trains and tunes a Lasso Regression model for feature selection.
+
+        Lasso (L1 regularization) drives coefficients of less important features to zero.
+        This method operates only on numerical features to provide interpretability regarding
+        physical variables (e.g., weather, speed).
+        """
         print("Regression: Tuning Lasso Model...")
         pipeline = Pipeline([
             ('imputer', SimpleImputer(strategy='mean')),
@@ -143,8 +209,16 @@ class TrafficRegressor:
         self.models['Lasso'] = grid.best_estimator_
         print(f"Regression: Lasso Tuned. Best Alpha: {grid.best_params_['model__alpha']}")
 
-    def evaluate(self):
-        """Returns summary metrics with Negative Clipping."""
+    def evaluate(self) -> pd.DataFrame:
+        """
+        Evaluates all trained models and returns a performance summary.
+
+        Applies 'Negative Clipping' to predictions (forcing values >= 0) to ensure
+        physical realism before calculating metrics.
+
+        Returns:
+            pd.DataFrame: A table containing 'RMSE', 'MAE', and 'R2' for each model.
+        """
         results = []
         for name, model in self.models.items():
             if name == 'Lasso':
@@ -163,7 +237,17 @@ class TrafficRegressor:
             results.append({'Model': name, 'RMSE': round(rmse, 2), 'MAE': round(mae, 2), 'R2': round(r2, 4)})
         return pd.DataFrame(results)
 
-    def get_feature_importance(self):
+    def get_feature_importance(self) -> pd.Series:
+        """
+        Extracts non-zero coefficients from the trained Lasso model.
+
+        Useful for identifying which numerical features (e.g., temperature, wind)
+        have the strongest impact on traffic volume.
+
+        Returns:
+            pd.Series: Sorted series of feature coefficients. Returns a string message
+                       if the Lasso model has not been trained.
+        """
         if 'Lasso' not in self.models: return "Lasso model not trained."
         model = self.models['Lasso'].named_steps['model']
         X_num = self.X.select_dtypes(include=np.number)

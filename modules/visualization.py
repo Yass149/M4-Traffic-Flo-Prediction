@@ -1,3 +1,20 @@
+"""
+Traffic Data Visualization Module.
+
+This module provides a dedicated class, `TrafficVisualizer`, to handle all graphical
+representations required for traffic data analysis. It covers three main areas:
+1. Exploratory Data Analysis (EDA): Trends, patterns, and correlations.
+2. Regression Analysis: Model performance and actual vs. predicted comparisons.
+3. Time Series Forecasting: Publication-ready forecast plots, ACF/PACF, and decomposition.
+
+Dependencies:
+    - matplotlib.pyplot
+    - seaborn
+    - pandas
+    - numpy
+    - statsmodels (for ACF/PACF and Decomposition objects)
+"""
+
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import seaborn as sns
@@ -6,10 +23,25 @@ import numpy as np
 
 class TrafficVisualizer:
     """
-    Handles all plotting for Traffic Analysis (EDA, Regression, Time Series).
+    A comprehensive visualization suite for Traffic Analysis.
+
+    This class encapsulates plotting logic to ensure consistent styling and 
+    reduce code duplication across notebooks or scripts. It automatically 
+    derives necessary temporal features (hour, day of week) upon initialization.
+
+    Attributes:
+        df (pd.DataFrame): A copy of the input DataFrame with added temporal 
+                           features ('hour', 'day_of_week', 'day_name').
     """
 
-    def __init__(self, df):
+    def __init__(self, df: pd.DataFrame):
+        """
+        Initializes the TrafficVisualizer.
+
+        Args:
+            df (pd.DataFrame): The input traffic data. Must have a DatetimeIndex 
+                               and a 'total_volume' column.
+        """
         self.df = df.copy()
         # Ensure date components exist for plotting
         if 'hour' not in self.df.columns:
@@ -23,6 +55,11 @@ class TrafficVisualizer:
     # ===============================================================
 
     def plot_traffic_overview(self):
+        """
+        Plots the full timeline of traffic volume.
+        
+        Useful for identifying long-term trends, seasonality, or missing data chunks.
+        """
         plt.figure(figsize=(15, 5))
         plt.plot(self.df.index, self.df['total_volume'], color='#333333', linewidth=0.5, alpha=0.8)
         plt.title("Traffic Volume Overview (Full Timeline)", fontsize=14, weight='bold')
@@ -31,15 +68,28 @@ class TrafficVisualizer:
         plt.show()
 
     def plot_weekly_patterns(self):
+        """
+        Displays a boxplot of traffic volume distribution by day of the week.
+        
+        The plot orders days from Monday to Sunday to highlight weekly cycles.
+        """
         plt.figure(figsize=(12, 6))
         order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-        if 'day_name' not in self.df.columns: self.df['day_name'] = self.df.index.day_name()
+        if 'day_name' not in self.df.columns: 
+            self.df['day_name'] = self.df.index.day_name()
+            
         sns.boxplot(x='day_name', y='total_volume', data=self.df, order=order, palette="viridis")
         plt.title("Traffic Volume Distribution by Day of Week", fontsize=14, weight='bold')
         plt.grid(True, alpha=0.3)
         plt.show()
 
     def plot_hourly_profile(self):
+        """
+        Compares average hourly traffic profiles between Weekdays and Weekends.
+        
+        Calculates the mean volume for every hour (0-23) separately for 
+        Mon-Fri and Sat-Sun.
+        """
         self.df['is_weekend'] = self.df.index.dayofweek >= 5
         weekday = self.df[~self.df['is_weekend']].groupby(self.df[~self.df['is_weekend']].index.hour)['total_volume'].mean()
         weekend = self.df[self.df['is_weekend']].groupby(self.df[self.df['is_weekend']].index.hour)['total_volume'].mean()
@@ -55,6 +105,12 @@ class TrafficVisualizer:
         plt.show()
 
     def plot_correlation_heatmap(self):
+        """
+        Generates a heatmap to visualize correlations between numerical features.
+        
+        Features included (if present): volume, speed, temperature, precipitation, 
+        wind speed, and visibility.
+        """
         cols = ['total_volume', 'avg_mph', 'temperature_C', 'precip_mm', 'wind_speed_ms', 'visibility_m']
         valid_cols = [c for c in cols if c in self.df.columns]
         plt.figure(figsize=(10, 8))
@@ -63,6 +119,11 @@ class TrafficVisualizer:
         plt.show()
 
     def plot_speed_flow_relationship(self):
+        """
+        Plots the Fundamental Diagram of Traffic Flow (Speed vs. Volume).
+        
+        Only renders if 'avg_mph' is present in the data.
+        """
         if 'avg_mph' not in self.df.columns: return
         plt.figure(figsize=(10, 6))
         plt.scatter(self.df['total_volume'], self.df['avg_mph'], alpha=0.05, color='purple', s=2)
@@ -77,10 +138,23 @@ class TrafficVisualizer:
     # ===============================================================
 
     def plot_regression_performance(self, y_true, y_pred, model_name="Model", r2_score=None):
+        """
+        Visualizes regression model performance with two subplots.
+
+        1. Time Series: Comparison of Actual vs. Predicted for the last 7 days.
+        2. Scatter Plot: Actual vs. Predicted values with a 'Perfect Fit' line.
+
+        Args:
+            y_true (pd.Series): Actual target values.
+            y_pred (pd.Series or np.array): Predicted values.
+            model_name (str, optional): Name of the model for the plot title. Defaults to "Model".
+            r2_score (float, optional): R2 score to display in the scatter plot title.
+        """
         plt.figure(figsize=(14, 6))
         
         # Subplot 1: Time Series (Last 7 Days)
         plt.subplot(1, 2, 1)
+        # Assuming 15-min intervals (96 intervals/day), adjust subset_n as needed for data frequency
         subset_n = 96 * 7
         y_true_sub = y_true.tail(subset_n) if hasattr(y_true, 'tail') else y_true[-subset_n:]
         y_pred_sub = y_pred[-subset_n:]
@@ -109,7 +183,16 @@ class TrafficVisualizer:
 
     def plot_forecast_publication_quality(self, train, test, forecast, rmse_val=None):
         """
-        Plots a high-quality forecast zoomed in on the transition period.
+        Generates a high-resolution forecast plot focused on the transition period.
+
+        Visualizes the end of the training data, the actual test ground truth, 
+        and the model forecast with optional confidence intervals.
+
+        Args:
+            train (pd.Series): Historical training data.
+            test (pd.Series): Actual future data for validation.
+            forecast (pd.Series): Predicted future values.
+            rmse_val (float, optional): Root Mean Squared Error to plot confidence bands (±1 RMSE).
         """
         plt.figure(figsize=(16, 7))
         
@@ -154,6 +237,13 @@ class TrafficVisualizer:
         plt.show()
 
     def plot_acf_pacf(self, series, lags=48):
+        """
+        Plots Autocorrelation (ACF) and Partial Autocorrelation (PACF) graphs.
+
+        Args:
+            series (pd.Series): The time series data.
+            lags (int, optional): Number of lags to include in the plot. Defaults to 48.
+        """
         from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8))
         plot_acf(series, lags=lags, ax=ax1)
@@ -162,6 +252,14 @@ class TrafficVisualizer:
         plt.show()
 
     def plot_decomposition(self, decomposition):
+        """
+        Visualizes the components of a Time Series Decomposition (STL).
+
+        Plots Observed, Trend, Seasonal, and Residual components in vertically stacked subplots.
+
+        Args:
+            decomposition: A DecomposeResult object (from statsmodels.tsa.seasonal_decompose).
+        """
         fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(15, 12), sharex=True)
         decomposition.observed.plot(ax=ax1, color='black')
         ax1.set_title('STL Decomposition')
