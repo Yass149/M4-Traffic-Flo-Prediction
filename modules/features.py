@@ -1,13 +1,36 @@
+"""
+Feature Engineering Module for Traffic Analysis.
+
+This module provides the `FeatureEngineer` class, which is responsible for enriching
+raw time-series data with temporal features. Its primary contribution is a robust
+handling of "School Term" vs. "Non-Term" days, which is a critical predictor for
+traffic patterns in university or school-adjacent areas.
+
+Dependencies:
+    - pandas
+    - datetime
+"""
+
 import pandas as pd
 from datetime import datetime, timedelta
 
 class FeatureEngineer:
     """
     Applies feature engineering to the traffic DataFrame.
-    Incorporates Ahmed's holiday logic but adapted for in-memory DataFrames.
+
+    This class encapsulates the logic for converting raw timestamps into machine-learning
+    ready features. It specifically handles 'Holiday Logic', parsing a custom schedule of
+    breaks and holidays to generate a binary 'day_type' feature (School Term vs. Off Day).
+
+    Attributes:
+        HOLIDAYS_RAW (list[str]): A hardcoded list of holiday ranges and single dates.
+        holiday_set (set[datetime.date]): A set of all individual holiday dates for O(1) lookup.
     """
 
     def __init__(self):
+        """
+        Initializes the FeatureEngineer and pre-computes the holiday lookup set.
+        """
         # raw holiday strings
         self.HOLIDAYS_RAW = [
             "2021-02-15 till 2021-02-19", "2021-04-01 till 2021-04-16", "2021-05-03",
@@ -25,8 +48,17 @@ class FeatureEngineer:
         ]
         self.holiday_set = self._generate_holiday_set()
 
-    def _generate_holiday_set(self):
-        """Parses Ahmed's string format into a set of date objects."""
+    def _generate_holiday_set(self) -> set:
+        """
+        Parses the string format into a set of date objects.
+
+        This handles two formats:
+        1. Single Date: "YYYY-MM-DD"
+        2. Date Range: "YYYY-MM-DD till YYYY-MM-DD"
+
+        Returns:
+            set: A set containing every individual date that is considered a holiday.
+        """
         holiday_set = set()
         for h in self.HOLIDAYS_RAW:
             if "till" in h:
@@ -41,9 +73,19 @@ class FeatureEngineer:
                 holiday_set.add(datetime.strptime(h, "%Y-%m-%d").date())
         return holiday_set
 
-    def _get_day_type(self, timestamp):
+    def _get_day_type(self, timestamp: pd.Timestamp) -> int:
         """
-        Returns 1 if Holiday/Weekend, 0 if School Term.
+        Determines the classification of a specific day.
+
+        Logic:
+        - Returns 1 (Off Day) if the day is a Weekend (Sat/Sun) OR in the `holiday_set`.
+        - Returns 0 (Term Day) otherwise.
+
+        Args:
+            timestamp (pd.Timestamp): The datetime to evaluate.
+
+        Returns:
+            int: 1 for Holiday/Weekend, 0 for School Term.
         """
         date_obj = timestamp.date()
         
@@ -57,9 +99,21 @@ class FeatureEngineer:
             
         return 0 # School Term
 
-    def add_features(self, df):
+    def add_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Takes the merged dataframe and adds time features + day_type.
+        Enriches the dataframe with temporal and domain-specific features.
+
+        Adds the following columns:
+        - 'hour': Hour of the day (0-23).
+        - 'month': Month of the year (1-12).
+        - 'day_of_week': Day of the week (Monday=0, Sunday=6).
+        - 'day_type': The binary classification (0=Term, 1=Off Day).
+
+        Args:
+            df (pd.DataFrame): Input dataframe with a DatetimeIndex.
+
+        Returns:
+            pd.DataFrame: A copy of the input dataframe with added features.
         """
         df = df.copy()
         
@@ -72,7 +126,7 @@ class FeatureEngineer:
         df['month'] = df.index.month
         df['day_of_week'] = df.index.dayofweek
         
-        # 2. Apply Ahmed's Logic (The Twist)
+        # 2. Apply Custom Logic
         # We create 'day_type' (0 or 1)
         df['day_type'] = df.index.to_series().apply(self._get_day_type)
         

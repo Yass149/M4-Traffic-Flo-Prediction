@@ -1,3 +1,22 @@
+"""
+Data Preprocessing Module for Traffic and Weather Analysis.
+
+This module serves as the ETL (Extract, Transform, Load) pipeline for the project.
+It contains two specialized processors and a merging logic:
+1.  `WeatherPreprocessor`: Handles the complex decoding of NOAA ISD FM-12 weather data,
+    including physical consistency checks (e.g., T >= Td) and unit conversions.
+2.  `TrafficPreprocessor`: Standardizes traffic sensor data, aggregates multiple
+    sensors, and resamples them to a regular grid.
+3.  `process_and_merge`: Aligns the two distinct time series onto a single
+    15-minute timeline using a left-join strategy to preserve ground-truth targets.
+
+Dependencies:
+    - pandas
+    - numpy
+    - logging
+    - os, glob
+"""
+
 import os
 import glob
 import pandas as pd
@@ -8,23 +27,28 @@ class WeatherPreprocessor:
     """
     End-to-end NOAA ISD FM-12 Weather Preprocessor for traffic modeling.
 
-    Transforms raw NOAA ISD CSV files into clean, 15-minute interval datasets
-    with decoded meteorological features, physical consistency checks,
-    outlier handling, and time-series ready resampling.
+    This class transforms raw NOAA ISD CSV files into clean, 15-minute interval datasets.
+    It handles the specific "FM-12" string encoding used by meteorological stations,
+    applies physical constraints (e.g., clipping humidity to 0-100%), and prepares
+    the data for time-series modeling.
+
+    Attributes:
+        weather_dir (str): Path to the directory containing raw CSV files.
+        log (logging.Logger): Logger instance for tracking processing errors.
+        FM12_FIELDS (list): List of specific NOAA columns required for decoding.
     """
 
     FM12_FIELDS = ["WND", "VIS", "TMP", "DEW", "SLP", "AA1", "CIG", "MA1", "OD1", "MD1"]
 
     def __init__(self, weather_dir: str = "data/weather", verbose: bool = False):
         """
-        Initialize the weather preprocessor.
+        Initializes the weather preprocessor.
 
-        Parameters
-        ----------
-        weather_dir : str
-            Directory containing NOAA ISD CSV files (default: "data/weather").
-        verbose : bool
-            Enable detailed logging if True (default: False).
+        Args:
+            weather_dir (str, optional): Directory containing NOAA ISD CSV files. 
+                                         Defaults to "data/weather".
+            verbose (bool, optional): If True, sets logging level to INFO. 
+                                      Defaults to False (WARNING).
         """
         self.weather_dir = weather_dir
         logging.basicConfig(
@@ -36,24 +60,19 @@ class WeatherPreprocessor:
 
     def load_raw(self) -> pd.DataFrame:
         """
-        Load and merge all NOAA weather CSV files from the weather directory.
+        Loads and merges all NOAA weather CSV files from the configured directory.
 
-        Combines multiple CSV files, parses DATE column to datetime index,
-        removes duplicates, and sorts chronologically.
+        It parses the 'DATE' column into a DatetimeIndex, removes duplicate timestamps,
+        and sorts the data chronologically.
 
-        Returns
-        -------
-        pd.DataFrame
-            Raw weather data indexed by timestamp.
+        Returns:
+            pd.DataFrame: A raw dataframe containing all columns from the CSVs, 
+                          indexed by timestamp.
 
-        Raises
-        ------
-        FileNotFoundError
-            If weather directory or CSV files are missing.
-        KeyError
-            If DATE column is absent.
-        RuntimeError
-            If no valid data after parsing.
+        Raises:
+            FileNotFoundError: If the weather directory does not exist or is empty.
+            KeyError: If the required 'DATE' column is missing from the data.
+            RuntimeError: If parsing results in an empty dataframe.
         """
         if not os.path.exists(self.weather_dir):
             raise FileNotFoundError(f"Weather directory not found: {self.weather_dir}")
@@ -89,22 +108,16 @@ class WeatherPreprocessor:
 
     def select_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Filter dataframe to FM-12 weather fields only.
+        Filters the dataframe to retain only relevant FM-12 weather fields.
 
-        Parameters
-        ----------
-        df : pd.DataFrame
-            Raw NOAA dataframe with all columns.
+        Args:
+            df (pd.DataFrame): The raw dataframe with all NOAA columns.
 
-        Returns
-        -------
-        pd.DataFrame
-            Dataframe containing only available FM-12 fields.
+        Returns:
+            pd.DataFrame: A subset of the dataframe containing only `FM12_FIELDS`.
 
-        Raises
-        ------
-        ValueError
-            If no FM-12 columns are present.
+        Raises:
+            ValueError: If none of the required FM-12 columns are present.
         """
         existing = [c for c in self.FM12_FIELDS if c in df.columns]
         if not existing:
@@ -114,21 +127,18 @@ class WeatherPreprocessor:
 
     def _split(self, series: pd.Series, idx: int, missing) -> pd.Series:
         """
-        Safely extract component from comma-separated FM-12 strings.
+        Helper method to parse comma-separated FM-12 strings.
 
-        Parameters
-        ----------
-        series : pd.Series
-            FM-12 encoded string column (e.g., "330,1,N,0021,1").
-        idx : int
-            Zero-based index of component to extract.
-        missing : str or list of str
-            Value(s) to replace with NaN.
+        NOAA data often packs multiple values into one string (e.g., "330,1,N,0021,1").
+        This method extracts a specific component by index.
 
-        Returns
-        -------
-        pd.Series
-            Extracted values with missing data handled.
+        Args:
+            series (pd.Series): The column of FM-12 strings.
+            idx (int): The zero-based index of the component to extract.
+            missing (str | list): Value(s) representing missing data to be replaced with NaN.
+
+        Returns:
+            pd.Series: A series of extracted values (as strings) with NaNs handled.
         """
         try:
             parts = series.str.split(",", expand=True)
@@ -144,26 +154,22 @@ class WeatherPreprocessor:
 
     def decode(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Decode FM-12 encoded columns into meteorological features.
+        Decodes FM-12 encoded columns into human-readable meteorological features.
 
-        Extracts and converts:
-        - temperature_C, dewpoint_C, rel_humidity (%)
-        - wind_dir_deg, wind_speed_ms
-        - visibility_m, pressure_hPa, precip_mm
-        - ceiling_m, low_ceiling_flag
-        - cloud_oktas, cloud_pct (%)
-        - obscuration_code, obscuration_type, fog_flag
-        - snow_depth_mm, snow_flag
+        Performs extraction, scaling (e.g., dividing by 10 for temperature), and 
+        calculation of derived features (e.g., Relative Humidity via Magnus formula).
 
-        Parameters
-        ----------
-        df : pd.DataFrame
-            Raw FM-12 encoded dataframe.
+        Features generated:
+        - Temperature/Dewpoint (C), Relative Humidity (%)
+        - Wind Direction (deg), Speed (m/s)
+        - Visibility (m), Pressure (hPa), Precipitation (mm)
+        - Cloud Cover (oktas & %), Ceiling Height (m)
 
-        Returns
-        -------
-        pd.DataFrame
-            Decoded features added to copy of input.
+        Args:
+            df (pd.DataFrame): The dataframe with raw FM-12 string columns.
+
+        Returns:
+            pd.DataFrame: A copy of the input dataframe with new decoded feature columns.
         """
         out = df.copy()
 
@@ -234,24 +240,20 @@ class WeatherPreprocessor:
 
     def clean_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Apply meteorological cleaning, consistency checks, and outlier clipping.
+        Applies meteorological consistency checks and handles outliers.
 
-        Key operations:
-        - Precipitation: clip [0,50mm], add rain_flag
-        - Ceiling: fog→50m, clear→20km, ffill/bfill, aviation categories
-        - Temperature/Dewpoint: T≥Td physics, UK clip [-30,40°C]
-        - Outliers: IQR clipping + hard physical limits
-        - Final forward/backward fill for completeness
+        Enforces physical laws and cleans data anomalies:
+        - **Precipitation:** Clipped to [0, 50mm].
+        - **Ceiling:** Infers values based on Fog (50m) or Clear Sky (20km).
+        - **Thermodynamics:** Ensures Dewpoint <= Temperature.
+        - **Outliers:** Applies IQR clipping for extreme UK temperatures.
+        - **Filling:** Uses forward/backward fill to handle missing steps.
 
-        Parameters
-        ----------
-        df : pd.DataFrame
-            Decoded weather features.
+        Args:
+            df (pd.DataFrame): The dataframe containing decoded features.
 
-        Returns
-        -------
-        pd.DataFrame
-            Cleaned features with zero NaNs and physical consistency.
+        Returns:
+            pd.DataFrame: A cleaned dataframe with no NaNs and physically consistent values.
         """
         df = df.copy()
 
@@ -320,30 +322,20 @@ class WeatherPreprocessor:
 
     def resample(self, df: pd.DataFrame, freq: str = "15min") -> pd.DataFrame:
         """
-        Resample the weather dataset to a regular time grid.
+        Resamples the weather dataset to a regular time grid (default 15 mins).
 
-        Behaviour
-        ---------
-        - Continuous variables:
-            Time-based interpolation on the new grid.
-        - Precipitation:
-            Forward-fill then fill remaining gaps with 0 (step-wise).
-        - Flags & categoricals:
-            Forward-fill state (no interpolation).
-        - Relative humidity:
-            Recomputed from temperature and dewpoint after interpolation.
+        Strategy:
+        - **Continuous (Temp, Wind):** Interpolated over time.
+        - **Accumulation (Precipitation):** Forward-filled, then gaps assumed 0.
+        - **Categorical (Flags):** Forward-filled (persistence model).
+        - **Derived (Humidity):** Re-calculated after interpolation to maintain physics.
 
-        Parameters
-        ----------
-        df : pd.DataFrame
-            Cleaned weather data with a DatetimeIndex.
-        freq : str, optional
-            Target resampling frequency (e.g. "15min", "1H").
+        Args:
+            df (pd.DataFrame): Cleaned weather data with a DatetimeIndex.
+            freq (str, optional): Target frequency string. Defaults to "15min".
 
-        Returns
-        -------
-        pd.DataFrame
-            Weather data resampled to the specified frequency.
+        Returns:
+            pd.DataFrame: The resampled dataframe aligned to the target grid.
         """
         if df.empty:
             raise ValueError("Cannot resample empty dataframe.")
@@ -382,66 +374,74 @@ class WeatherPreprocessor:
 
         return df15
 
-
     def drop_raw_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Remove original FM-12 string columns after successful decoding.
+        Removes the original FM-12 string columns from the dataframe.
 
-        Parameters
-        ----------
-        df : pd.DataFrame
-            Decoded dataframe with raw + processed columns.
+        Args:
+            df (pd.DataFrame): The dataframe containing both raw and processed columns.
 
-        Returns
-        -------
-        pd.DataFrame
-            Cleaned dataframe without raw FM-12 strings.
+        Returns:
+            pd.DataFrame: Dataframe with only the cleaned, numeric feature columns.
         """
         raw_cols = [c for c in self.FM12_FIELDS if c in df.columns]
         return df.drop(columns=raw_cols)
 
-    def run(self,freq:str='15min',save_path: str | None = None) -> pd.DataFrame:
+    def run(self, freq: str = '15min', save_path: str | None = None) -> pd.DataFrame:
         """
-        Execute complete preprocessing pipeline.
+        Executes the full weather preprocessing pipeline.
 
-        Pipeline: load → select FM-12 → decode → clean → drop raw → resample 15min.
+        Steps: Load -> Select FM-12 -> Decode -> Clean -> Drop Raw -> Resample.
 
-        Parameters
-        ----------
-        save_path : str, optional
-            Path to save cleaned CSV (default: None).
+        Args:
+            freq (str, optional): Target frequency for resampling. Defaults to '15min'.
+            save_path (str | None, optional): If provided, saves the result to this CSV path.
 
-        Returns
-        -------
-        pd.DataFrame
-            Final cleaned, resampled 15-minute weather dataset with 19 features.
+        Returns:
+            pd.DataFrame: The final processed weather dataset.
         """
         df = self.load_raw()
         df = self.select_columns(df)
         df = self.decode(df)
         df = self.clean_features(df)
         df = self.drop_raw_columns(df)
-        df = self.resample(df,freq)
+        df = self.resample(df, freq)
 
         if save_path:
             df.to_csv(save_path)
             self.log.info(f"Weather data saved: {save_path}")
         return df
+
+
 class TrafficPreprocessor:
     """
-    Load and preprocess traffic data.
+    Handles loading, standardizing, and aggregating traffic sensor data.
 
-    1) Raw loading/concatenation
-    2) Standardisation (names + timestamp index)
-    3) Cleaning, aggregation, and resampling
+    This class is responsible for:
+    1.  Loading raw traffic CSVs.
+    2.  Standardizing column names (e.g., 'Total Volume' -> 'total_volume').
+    3.  Creating a unified DatetimeIndex.
+    4.  Aggregating data from multiple sensors (handling outages via mean aggregation).
+
+    Attributes:
+        data_dir (str): Directory containing traffic data CSVs.
     """
 
     def __init__(self, data_dir: str = "data/traffic"):
+        """
+        Args:
+            data_dir (str, optional): Path to traffic data. Defaults to "data/traffic".
+        """
         self.data_dir = data_dir
 
     # 1) LOADING ONLY
     def load_raw(self) -> pd.DataFrame | None:
-        """Load and concatenate raw traffic CSV files without aggregation."""
+        """
+        Loads and concatenates raw traffic CSV files.
+
+        Returns:
+            pd.DataFrame | None: Concatenated raw data, or None if no files found.
+        """
         data_dir = self.data_dir
 
         if not os.path.exists(data_dir):
@@ -477,11 +477,15 @@ class TrafficPreprocessor:
     # 2) STANDARDISATION
     def standardise(self, raw_df: pd.DataFrame) -> pd.DataFrame:
         """
-        Standardise column names and create a datetime index.
+        Standardises column names and constructs a clean DatetimeIndex.
 
-        - Build `timestamp` from `Report Date` + `Time Period Ending`
-        - Set sorted DatetimeIndex
-        - Rename `Total Volume` → `total_volume`, `Avg mph` → `avg_mph`
+        Parses 'Report Date' and 'Time Period Ending' into a single 'timestamp'.
+
+        Args:
+            raw_df (pd.DataFrame): The raw loaded dataframe.
+
+        Returns:
+            pd.DataFrame: Dataframe with 'timestamp' index and standard column names.
         """
         df = raw_df.copy()
 
@@ -502,13 +506,19 @@ class TrafficPreprocessor:
         return df
 
     # 3) TREATMENT / CLEANING
-    def process(self, std_df: pd.DataFrame, freq: str="15min") -> pd.DataFrame | None:
+    def process(self, std_df: pd.DataFrame, freq: str = "15min") -> pd.DataFrame | None:
         """
-        Aggregate sensors and resample to a 15‑minute grid.
+        Aggregates sensor data and resamples to a regular grid.
 
-        - Aggregate duplicate timestamps across sensors using MEAN
-        - Resample to regular 15‑minute intervals with MEAN
-        - Reset index before returning
+        - **Aggregation:** Uses MEAN to combine multiple sensors (robust to single sensor outages).
+        - **Resampling:** Defaults to MEAN for 15-minute intervals.
+
+        Args:
+            std_df (pd.DataFrame): Standardized dataframe.
+            freq (str, optional): Target frequency. Defaults to "15min".
+
+        Returns:
+            pd.DataFrame | None: Final processed traffic data with index reset.
         """
         try:
             df = std_df.copy()
@@ -529,9 +539,15 @@ class TrafficPreprocessor:
             return None
 
     # 4) CONVENIENCE WRAPPER
-    def load_traffic_data(self,freq: str="15min") -> pd.DataFrame | None:
+    def load_traffic_data(self, freq: str = "15min") -> pd.DataFrame | None:
         """
-        Full pipeline: load → standardise → process.
+        Executes the full traffic pipeline: Load -> Standardise -> Process.
+
+        Args:
+            freq (str, optional): Target frequency. Defaults to "15min".
+
+        Returns:
+            pd.DataFrame | None: The final processed traffic dataset.
         """
         raw_df = self.load_raw()
         if raw_df is None:
@@ -539,36 +555,28 @@ class TrafficPreprocessor:
         std_df = self.standardise(raw_df)
         return self.process(std_df)
 
+
 def process_and_merge(traffic_df: pd.DataFrame, weather_df: pd.DataFrame, freq: str = "15min") -> pd.DataFrame:
     """
-    Merge regularly sampled traffic data with weather features on a common time grid.
+    Merges traffic and weather data onto a unified time grid.
 
-    Behaviour
-    ---------
-    - Traffic (target):
-        Parsed to a DatetimeIndex, sorted, and resampled to the requested
-        frequency using `asfreq()` so gaps remain as NaN (no forward-fill).
-    - Weather (features):
-        Parsed to a DatetimeIndex, sorted, resampled to the same frequency,
-        and forward-filled (atmosphere evolves smoothly).
-    - Merge:
-        Left join weather onto traffic timestamps only.
-        Forward-fill *weather columns only* (limit=2) to avoid target leakage.
-        Clip any negative `total_volume` values to zero.
+    Strategy:
+    1.  **Traffic (Target):** Resampled via `asfreq()`. Gaps remain NaN (no artificial targets).
+    2.  **Weather (Features):** Resampled and Forward-Filled (atmosphere evolves continuously).
+    3.  **Merge:** Left Join onto Traffic timestamps.
+    4.  **Leakage Prevention:** Weather is forward-filled *after* join with a limit of 2 steps.
 
-    Parameters
-    ----------
-    traffic_df : pd.DataFrame
-        Cleaned traffic data with `timestamp` and `total_volume` (and optionally `avg_mph`).
-    weather_df : pd.DataFrame
-        Processed weather data indexed by datetime.
-    freq : str, optional
-        Target resampling frequency (e.g. "15min", "1H").
+    Args:
+        traffic_df (pd.DataFrame): Processed traffic data.
+        weather_df (pd.DataFrame): Processed weather data.
+        freq (str, optional): Target frequency. Defaults to "15min".
 
-    Returns
-    -------
-    pd.DataFrame
-        Merged traffic–weather dataframe on the specified grid.
+    Returns:
+        pd.DataFrame: The merged dataset ready for model training.
+
+    Raises:
+        ValueError: If inputs are empty.
+        RuntimeError: If merging fails.
     """
     if traffic_df is None or traffic_df.empty:
         raise ValueError("traffic_df is empty.")

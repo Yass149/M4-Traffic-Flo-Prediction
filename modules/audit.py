@@ -1,9 +1,37 @@
+"""
+Data Audit and Quality Assurance Module.
+
+This module provides tools to audit the raw datasets before they enter the preprocessing
+pipelines. It includes specialized logic for:
+1.  **Weather Data (FM-12):** Parsing and validating comma-separated NOAA string codes
+    (checking for '9999' sentinels, missing components, and physical range sanity).
+2.  **Traffic Data:** Checking for time-series continuity, zero-volume anomalies,
+    and physical realism (e.g., negative speeds).
+
+Dependencies:
+    - numpy
+    - pandas
+"""
+
 import numpy as np
 import pandas as pd
 
 
-def sentinel_share(series, bad_values):
-    """Percentage of non NA entries equal to any of `bad_values`."""
+def sentinel_share(series: pd.Series, bad_values: list | str | int) -> float:
+    """
+    Calculates the percentage of non-NA entries that match specific 'bad' sentinel values.
+
+    This is useful for NOAA data where missing values are often encoded as specific
+    integers (e.g., 9999) rather than standard NaNs.
+
+    Args:
+        series (pd.Series): The data series to check.
+        bad_values (list | str | int): A single value or list of values to treat as 'bad'.
+
+    Returns:
+        float: The percentage (0.0 to 100.0) of present data that matches the bad values.
+               Returns 0.0 if the series is entirely NA.
+    """
     if not isinstance(bad_values, (list, tuple, set)):
         bad_values = [bad_values]
     s = series.astype("string")
@@ -14,10 +42,25 @@ def sentinel_share(series, bad_values):
     return 100.0 * bad / n
 
 
-def split_fm12(series: pd.Series, idx: int, missing) -> pd.Series:
+def split_fm12(series: pd.Series, idx: int, missing: list | str) -> pd.Series:
     """
-    Split FM‑12 strings like '330,1,N,0021,1' and return the idx‑th component,
-    replacing `missing` codes in that component with NaN.
+    Extracts a specific component from a comma-separated FM-12 weather string.
+
+    NOAA Integrated Surface Database (ISD) data packs multiple observations into single
+    strings. For example, a wind column might look like: `"330,1,N,0021,1"`.
+    This function splits the string and returns the component at `idx`, replacing
+    specific sentinel codes with NaN.
+
+    
+
+    Args:
+        series (pd.Series): Series containing FM-12 formatted strings.
+        idx (int): Zero-based index of the component to extract (e.g., 0 for wind dir, 3 for speed).
+        missing (list | str): Value(s) within that specific component that represent
+                              missing data (e.g., "9999").
+
+    Returns:
+        pd.Series: The extracted component series with missing values replaced by NaN.
     """
     try:
         parts = series.astype("string").str.split(",", expand=True)
@@ -32,17 +75,27 @@ def split_fm12(series: pd.Series, idx: int, missing) -> pd.Series:
         return pd.Series([np.nan] * len(series), index=series.index)
 
 
-def weather_data_audit(df: pd.DataFrame):
+def weather_data_audit(df: pd.DataFrame) -> dict:
     """
-    QA/QC audit on FM‑12 style hourly weather data for traffic modelling.
+    Performs a comprehensive QA/QC audit on FM-12 hourly weather data.
 
-    Returns
-    -------
-    dict with keys:
-      - 'basic'    : row/column counts, time coverage, % duplicates
-      - 'missing'  : per-column NA % (raw + split)
-      - 'sentinels': per-variable sentinel stats (raw + split)
-      - 'ranges'   : simple physical range checks for TMP/DEW/SLP
+    This function analyzes the dataframe for structural integrity, missingness, and
+    physical plausibility. It specifically handles the complexity of FM-12 sentinel
+    codes (e.g., '99999' for missing pressure).
+
+    **Side Effect:**
+        This function **modifies the input DataFrame** by adding new columns representing
+        the split components (e.g., `TMP_val`, `TMP_q`) to facilitate inspection.
+
+    Args:
+        df (pd.DataFrame): Raw weather dataframe containing FM-12 columns (TMP, DEW, SLP, AA1).
+
+    Returns:
+        dict: A nested dictionary containing the audit report:
+            - **basic:** Rows, cols, duplicate index %, time coverage.
+            - **missing:** Raw NA % for every column.
+            - **sentinels:** Detailed breakdown of sentinel code frequency for specific fields.
+            - **ranges:** Min/Max values for physical variables (Temp, Dew, Pressure) post-cleaning.
     """
     report = {
         "basic": {},
@@ -84,7 +137,6 @@ def weather_data_audit(df: pd.DataFrame):
 
     sent = {}
 
-    # You can extend this list with additional sentinel codes if needed
     fm12_fields = [
         ("TMP", "9999,9",  ["9999"]),    # air temperature
         ("DEW", "9999,9",  ["9999"]),    # dew point
@@ -248,12 +300,28 @@ def weather_data_audit(df: pd.DataFrame):
     return report
 
 
-def traffic_data_audit(df: pd.DataFrame):
+def traffic_data_audit(df: pd.DataFrame) -> dict:
     """
-    QA/QC audit for a cleaned traffic panel with columns:
-      - timestamp (DatetimeIndex or column)
-      - total_volume
-      - avg_mph
+    QA/QC audit for a cleaned traffic panel.
+
+    This function expects a traffic dataframe that has typically been standardized
+    (e.g., via `TrafficPreprocessor`). It checks for common sensor errors like
+    negative speeds, zero-volume runs, and data gaps.
+
+    **Note:** This function operates on a copy of the dataframe and does not modify
+    the original input.
+
+    Args:
+        df (pd.DataFrame): Traffic data with at least `total_volume` and `avg_mph` columns.
+                           Ideally indexed by Datetime, but can handle a 'timestamp' column.
+
+    Returns:
+        dict: A nested dictionary containing the audit report:
+            - **basic:** Rows, cols, freq, index duplicates.
+            - **missing:** NA % per column.
+            - **volumes:** Stats on `total_volume` (min, max, % zero, time-of-day means).
+            - **speeds:** Stats on `avg_mph` (% >90mph, % negative).
+            - **consistency:** Completeness of daily records (e.g., % days with full 96 intervals).
     """
 
     report = {
