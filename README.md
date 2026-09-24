@@ -1,5 +1,10 @@
 # Traffic flow prediction
 
+[![Python 3.11](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+![Jupyter](https://img.shields.io/badge/Jupyter-Notebook-F37626?logo=jupyter&logoColor=white)
+![pandas](https://img.shields.io/badge/pandas-data%20pipeline-150458?logo=pandas&logoColor=white)
+![statsmodels](https://img.shields.io/badge/statsmodels-time%20series-4051B5)
+
 An end-to-end traffic forecasting study combining historical traffic counts, weather signals and calendar features. The repository compares regression and time-series approaches on 15-minute traffic-flow observations and keeps modelling logic outside the presentation notebook.
 
 > **Project status:** reproducible analysis project. The repository contains the modelling pipeline and rendered analysis, but no public prediction API or continuously deployed service.
