@@ -1,120 +1,77 @@
-# 🚦 CSMAD CW2: M4 Traffic Flow Prediction (Group 02)
+# Traffic flow prediction
 
-**Team:** Yassine, Amir, Ahmed  
-**Deadline:** Tuesday, 16 December 2025 (12:00 Noon)  
-**Goal:** Predict traffic flow using Regression & Time Series models.
+An end-to-end traffic forecasting study combining historical traffic counts, weather signals and calendar features. The repository compares regression and time-series approaches on 15-minute traffic-flow observations and keeps modelling logic outside the presentation notebook.
 
----
+> **Project status:** reproducible analysis project. The repository contains the modelling pipeline and rendered analysis, but no public prediction API or continuously deployed service.
 
-## 🛑 CRITICAL RULES (Read Before Coding)
+## What this project demonstrates
 
-**1. DO NOT Push Directly to `main`**
-* **Risk:** If you break `main`, you break the project for everyone.
-* **Rule:** ALWAYS work on your own branch.
-    * `git checkout -b amir-weather-dev`
-    * `git checkout -b ahmed-dates-dev`
-* **Merge:** Only merge to `main` when your code is working and tested.
+- Resampling traffic observations onto a consistent 15-minute time grid.
+- Cleaning and transforming weather and calendar inputs.
+- Engineering time, holiday and seasonal features.
+- Comparing regression and time-series forecasts with visual diagnostics.
+- Separating reusable Python modules from the final notebook/report.
 
-**2. DO NOT Write Analysis Code in the Notebook**
-* **Risk:** We will lose marks. The brief requires code to be in **external modules**.
-* **Rule:** Write your logic in the `modules/` folder (`.py` files). The Notebook is ONLY for importing modules and displaying results.
+## Pipeline
 
-**3. DO NOT Edit the Master Notebook Simultaneously**
-* **Risk:** Git cannot merge Jupyter Notebooks. If two people save `Group_02_CSMAD_CW2.ipynb` at the same time, the file will corrupt.
-* **Rule:** Use a temporary "scratchpad" notebook (e.g., `test_amir.ipynb`) to test your code. **Yassine** will manage the final master notebook updates.
+```text
+traffic + weather + calendar data
+                │
+                ▼
+      parsing, validation and joins
+                │
+                ▼
+       15-minute feature table
+                │
+        ┌───────┴────────┐
+        ▼                ▼
+   regression        time series
+        └───────┬────────┘
+                ▼
+     forecast comparison and plots
+```
 
----
+The feature contract is explicit: `timestamp` is the datetime column, `total_volume` is the target, and all observations are aligned to 15-minute intervals before modelling.
 
-## 🍏 Mac Setup Instructions (3 Steps)
+## Repository layout
 
-### Step 1: Clone the Repository
-1.  Open **VS Code**.
-2.  Press **Cmd + Shift + P** (Command Palette).
-3.  Type `Git: Clone` and press Enter.
-4.  Paste our GitLab URL: `[INSERT URL HERE]`
-5.  Select a folder to save it.
-6.  Enter your **University Username** and **Password** if prompted.
+```text
+modules/
+  audit.py          data quality checks
+  preprocessing.py  parsing and cleaning
+  features.py       calendar and modelling features
+  regression.py     regression workflows
+  timeseries.py     time-series workflows
+  visualization.py  charts and diagnostics
+count.py             command-line entry point
+02_CSMAD_CW2.ipynb   presentation notebook
+02_CSMAD_CW2.html    rendered notebook output
+data/                source data and documentation
+```
 
-### Step 2: Verify the Data
-*The data is already included in this repository.*
-1.  Open the file explorer in VS Code.
-2.  Check that you see the `data/` folder with these contents:
-    * `data/traffic/` (8 CSV files)
-    * `data/weather/` (4 CSV files)
-    * `data/dates/` (PDF calendars)
+The notebook is the readable report; the implementation lives in `modules/` so it can be tested, reviewed and reused.
 
-### Step 3: Check Your Python Environment
-1.  Open any `.py` file in the `modules/` folder.
-2.  Look at the bottom-right corner of VS Code.
-3.  Ensure it says **3.11.7** (or `base (Anaconda)`).
-    * *If not:* Click it -> Select Interpreter -> Choose the correct Conda environment.
+## Run locally
 
----
+```bash
+git clone https://github.com/Yass149/M4-Traffic-Flo-Prediction.git
+cd M4-Traffic-Flo-Prediction
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt  # add project dependencies if using a fresh environment
+python count.py --help
+```
 
-## 📂 Project Structure (Strict Requirement)
+The repository was developed with Python 3.11. Run the notebook or open the committed HTML report to inspect the analysis. Dataset availability and licensing follow the source-data documentation in `data/`.
 
-We must follow this structure for the "Technical Implementation" marks.
+## Engineering notes
 
-    ├── modules/                  <-- ALL LOGIC GOES HERE (The Python Package)
-    │   ├── __init__.py           <-- Makes this importable
-    │   ├── data_loader.py        <-- Functions to load/merge Traffic CSVs
-    │   ├── preprocessing.py      <-- Functions to decode Weather strings
-    │   ├── features.py           <-- Functions to identify School Holidays
-    │   ├── modelling.py          <-- Classes for Regression & Time Series
-    │   └── visualization.py      <-- Plotting functions
-    │
-    ├── data/                     <-- Raw Data (Do not edit these files)
-    │
-    ├── Group_02_CSMAD_CW2.ipynb  <-- FINAL SUBMISSION NOTEBOOK (Presentation Only)
-    └── .gitignore                <-- Keeps the repo clean
+The code is organised so data loading, preprocessing, features, models and visualisation can be changed independently. The current repository should be treated as a research/portfolio pipeline rather than a production service: it does not include CI, model registry, scheduled retraining, online monitoring or an authenticated serving layer.
 
----
+## Next production step
 
-## 📅 Work Division (To Be Agreed)
+Package the feature pipeline behind a versioned batch job or API, add time-based backtesting and regression tests for data contracts, persist model artefacts with metadata, and monitor forecast error and data drift after deployment.
 
-Please update this table once we agree on roles.
+## Context
 
-| Role | Responsibility | Assigned To |
-| :--- | :--- | :--- |
-| **Traffic Handler** | Write `data_loader.py` to merge 8 traffic CSVs & fix timestamps. | *Pending* |
-| **Weather Decoder** | Write `preprocessing.py` to decode FM-12 strings (read `CSV_HELP.pdf`). | *Pending* |
-| **Date Engineer** | Parse PDFs in `data/dates/` to create a "Day Type" feature (School vs Holiday). | *Pending* |
-| **Modeller** | Build Regression & Time Series models in `modelling.py`. | *Joint Effort* |
-
----
-
-## 📝 Coding Standards (The Contract)
-
-**IMPORTANT:** To ensure our code works together when we merge, everyone must follow these naming rules:
-
-1.  **Time Column:** Always name the datetime column `timestamp`.
-2.  **Target Column:** Always name the traffic count column `total_volume`.
-3.  **Time Interval:** All data must be resampled to **15-minute intervals**.
-4.  **Docstrings:** Every function **MUST** have a docstring (Required for marks).
-
-**Docstring Example:**
-
-    def my_function(df):
-        """
-        Brief description of what the function does.
-        
-        Args: 
-            df (pd.DataFrame): Input dataframe.
-            
-        Returns: 
-            pd.DataFrame: Processed dataframe.
-        """
-        pass
-
----
-
-## 🚀 How to Start Working
-
-1.  **Switch Branch:** `git checkout -b [your-name]-dev`
-2.  **Code:** Write your function in the `modules/` folder.
-3.  **Test:** Create a file named `test_[name].ipynb` (e.g. `test_amir.ipynb`) to run your code.
-4.  **Push:**
-    * Click Source Control (Graph icon).
-    * Stage your changes (+).
-    * Message: "Implemented weather decoder".
-    * Commit & Sync (Push).
+Built for the University of Reading CSMAD coursework in collaboration with the project team. Assessment deadlines and team-work instructions are intentionally kept out of the project landing page.
